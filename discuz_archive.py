@@ -14,6 +14,7 @@ import hmac
 import html
 from html.parser import HTMLParser
 from http.cookiejar import MozillaCookieJar, CookieJar
+from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
@@ -36,7 +37,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlsplit, urlunsplit, quo
 from urllib.request import Request, build_opener, HTTPCookieProcessor, HTTPRedirectHandler
 from urllib.robotparser import RobotFileParser
 
-VERSION = '1.0.0'
+VERSION = '1.1.0'
 LOG = logging.getLogger('discuz-archive')
 TRACE = secrets.token_hex(6)
 VOID = {'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr'}
@@ -44,6 +45,18 @@ VOID = {'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'met
 
 class ArchiveError(RuntimeError):
     pass
+
+
+class FetchError(ArchiveError):
+    def __init__(self, status: int):
+        self.status = status
+        super().__init__(f'HTTP request failed: status={status}')
+
+
+class InsufficientImages(ArchiveError):
+    def __init__(self, available: int, required: int, reason: str = 'below_min_images'):
+        self.available, self.required, self.reason = available, required, reason
+        super().__init__(f'Available images {available} below threshold {required}: {reason}')
 
 
 class JsonLog(logging.Formatter):
@@ -78,6 +91,7 @@ class Config:
     max_pages: int = 10000
     max_image_bytes: int = 32 * 1024 * 1024
     max_post_bytes: int = 256 * 1024 * 1024
+    min_images: int = 0
     respect_robots: bool = True
     web_enabled: bool = True
     web_host: str = '127.0.0.1'
@@ -101,6 +115,9 @@ class Config:
         key = str(forum.get('key', '')).strip()
         if not re.fullmatch(r'[A-Za-z0-9_.-]{1,80}', key):
             raise ArchiveError('forum.key must be a stable 1–80 character identifier')
+        minimum = archive.get('min_images', 0)
+        if type(minimum) is not int or minimum < 0:
+            raise ArchiveError('archive.min_images must be a nonnegative integer')
         config = cls(
             forum_key=key, url=http_url(str(forum.get('url', ''))),
             output_dir=local(archive.get('output_dir', 'output')),
@@ -115,6 +132,7 @@ class Config:
             retries=int(request.get('retries', 2)), max_pages=int(request.get('max_pages', 10000)),
             max_image_bytes=int(request.get('max_image_mb', 32)) * 1024 * 1024,
             max_post_bytes=int(request.get('max_post_mb', 256)) * 1024 * 1024,
+            min_images=minimum,
             respect_robots=bool(request.get('respect_robots', True)),
             web_enabled=bool(web.get('enabled', True)),
             web_host=str(web.get('host', '127.0.0.1')), web_port=int(web.get('port', 8080)),
@@ -250,11 +268,11 @@ class Client:
                 retry_after = error.headers.get('Retry-After', '')
                 error.close()
                 if status not in {429, 500, 502, 503, 504} or attempt == self.config.retries:
-                    raise ArchiveError(f'HTTP request failed: status={status}') from None
+                    raise FetchError(status) from None
                 if retry_after.isdecimal() and int(retry_after) > 30:
                     raise ArchiveError('Server requested a longer pause; retry on a later run') from None
                 time.sleep(max(2 ** attempt, int(retry_after) if retry_after.isdecimal() else 0))
-            except (URLError, TimeoutError, OSError):
+            except (URLError, TimeoutError, OSError, HTTPException):
                 if attempt == self.config.retries:
                     raise ArchiveError('Network request failed or timed out') from None
                 time.sleep(2 ** attempt)
@@ -496,15 +514,41 @@ class Cleaner:
     def __init__(self, client: Client, page: str):
         self.client, self.config, self.page = client, client.config, page
         self.images = {}
+        self.failed_sources = set()
         self.total_bytes = 0
 
     def image(self, node: Node):
+        # Failed sources are cached too: repeated broken tags must not multiply
+        # network attempts or count as additional images.
+        source = next((node.attrs.get(key) for key in
+                       ('zoomfile', 'file', 'data-original', 'data-src', 'src') if node.attrs.get(key)), '')
+        attempt_key = source
+        try:
+            if not source.startswith('data:'):
+                attempt_key = http_url(urljoin(self.page, source))
+            if self.config.min_images and attempt_key in self.failed_sources:
+                return ''
+            return self._image(node)
+        except (ArchiveError, ValueError) as error:
+            if not self.config.min_images:
+                raise
+            self.failed_sources.add(attempt_key)
+            identity = link_identity(self.page)
+            LOG.warning('image_unavailable tid=%s status=%s reason_type=%s available=%d',
+                        identity[1] if identity else 'unknown', getattr(error, 'status', None),
+                        type(error).__name__, len(self.images))
+            return ''
+
+    def _image(self, node: Node):
         a = node.attrs
         source = next((a.get(key) for key in ('zoomfile', 'file', 'data-original', 'data-src', 'src') if a.get(key)), '')
         if not source:
             raise ArchiveError('An inline image has no usable source')
         if ('/smiley/' in source or '/smilies/' in source):
             return html.escape(a.get('alt', ''))
+        if re.search(r'(?:^|/)(?:static/image/common|images/default)/(?:none|loading|imgloading|placeholder)\.(?:gif|png)$',
+                     urlsplit(source).path, re.I):
+            return ''
         if a.get('width') == '1' and a.get('height') == '1':
             return ''
         if source.startswith('data:'):
@@ -528,9 +572,9 @@ class Cleaner:
             if data is None:
                 data, _, _ = self.client.fetch(source, self.config.max_image_bytes, self.page)
             mime = image_type(data)
-            self.total_bytes += len(data)
-            if self.total_bytes * 4 // 3 > self.config.max_post_bytes:
+            if (self.total_bytes + len(data)) * 4 // 3 > self.config.max_post_bytes:
                 raise ArchiveError('Post exceeds configured archive size limit')
+            self.total_bytes += len(data)
             self.images[key] = 'data:' + mime + ';base64,' + base64.b64encode(data).decode('ascii')
         return '<img loading="lazy" src="' + self.images[key] + '" alt="' + html.escape(a.get('alt', ''), quote=True) + '">'
 
@@ -539,7 +583,9 @@ class Cleaner:
             return html.escape(node)
         if discard(node, self.config):
             return ''
-        if 'locked' in node.classes() or 'showhide' in node.classes():
+        if needs_access(node):
+            if self.config.min_images:
+                return ''
             raise ArchiveError('Main post contains content requiring additional access')
         if node.tag == 'img':
             return self.image(node)
@@ -548,6 +594,8 @@ class Cleaner:
             return content
         attrs = ''
         if node.tag == 'a':
+            if not content.strip():
+                return ''
             href = urljoin(self.page, node.attrs.get('href', ''))
             p = urlsplit(href)
             if p.scheme not in ('http', 'https') or p.username or p.password:
@@ -593,10 +641,19 @@ def shell(title: str, content: str, *, web=False):
             '</head><body><main>' + content + '</main></body></html>').encode('utf-8')
 
 
+def needs_access(node: Node):
+    return bool(node.classes() & {'attach_nopermission', 'locked', 'showhide'} or
+                node.attrs.get('id', '').startswith('attach_nopermission'))
+
+
 def extract_post(root: Node, client: Client, page: str):
     nodes = list(root.walk())
     bodies = [n for n in nodes if re.fullmatch(r'postmessage_\d+', n.attrs.get('id', ''))]
     if not bodies:
+        if client.config.min_images and re.search(
+                r'请先登录|需要登录|无权阅读|无权访问|没有权限|阅读权限不足|permission denied|access denied|login required',
+                root.text(), re.I):
+            raise InsufficientImages(0, client.config.min_images, 'access_restricted')
         raise ArchiveError('No main post found; unsupported template, login, or access restriction')
     body = bodies[0]
     pid = body.attrs['id'].split('_')[-1]
@@ -604,8 +661,8 @@ def extract_post(root: Node, client: Client, page: str):
     container = next((n for n in ancestors if n.attrs.get('id') == 'post_'+pid), None)
     if container is None:
         container = next((n for n in ancestors if n.attrs.get('id') == 'pid'+pid), body)
-    if any(n.classes() & {'attach_nopermission', 'locked', 'showhide'} or
-           n.attrs.get('id', '').startswith('attach_nopermission') for n in container.walk()):
+    restricted = any(needs_access(n) for n in container.walk())
+    if restricted and not client.config.min_images:
         raise ArchiveError('Main post or attachments require additional access; not a complete archive')
     heading = next((n for n in nodes if n.attrs.get('id') == 'thread_subject'), None)
     if heading is None:
@@ -627,20 +684,30 @@ def extract_post(root: Node, client: Client, page: str):
     published = next((n.text().strip() for n in container.walk()
                       if n.attrs.get('id', '').startswith('authorposton')), '')
     cleaner = Cleaner(client, page)
-    content = cleaner.render(body)
+    body_scope = [body]
+    if container is not body:
+        for ancestor in ancestors:
+            body_scope.append(ancestor)
+            if ancestor is container:
+                break
+    protected_body = any(needs_access(n) for n in body_scope)
+    content = '' if client.config.min_images and protected_body else cleaner.render(body)
     included = {id(n) for n in body.walk()}
     # Discuz sometimes stores original image attachments beside postmessage, within the same floor.
     for node in container.walk():
         if node.tag == 'img' and id(node) not in included and (
                 node.attrs.get('id', '').startswith('aimg_') or node.attrs.get('aid')):
-            if not any(discard(n, client.config) for n in [node, *node.ancestors()] if n is not container.parent):
+            if not any(discard(n, client.config) or needs_access(n) for n in [node, *node.ancestors()] if n is not container.parent):
                 content += cleaner.image(node)
+    if len(cleaner.images) < client.config.min_images:
+        reason = 'access_restricted' if restricted else 'below_min_images'
+        raise InsufficientImages(len(cleaner.images), client.config.min_images, reason)
     if not re.sub(r'<[^>]+>|\s+', '', content) and not cleaner.images:
         raise ArchiveError('Main post is empty after cleaning')
     metadata = ' · '.join(html.escape(s) for s in (author, published) if s)
     about = ('<footer><details><summary>关于存档</summary><p>来源：<a rel="noreferrer" href="' +
              html.escape(page, quote=True) + '">原帖</a> · 内容版权归原作者所有。'
-             '此文件保存首次完整抓取的版本。作者：***。</p></details></footer>')
+             '此文件保存首次接受归档时可获取的内容。作者：***。</p></details></footer>')
     result = shell(title, '<article><h1>' + html.escape(title) + '</h1><div class="meta">' +
                    metadata + '</div>' + content + '</article>' + about)
     if len(result) > client.config.max_post_bytes:
@@ -690,11 +757,30 @@ CREATE TABLE IF NOT EXISTS pending(
  forum_key TEXT NOT NULL, tid TEXT NOT NULL, title TEXT NOT NULL,
  filename TEXT NOT NULL UNIQUE, tmp_name TEXT NOT NULL, sha256 TEXT NOT NULL,
  size INTEGER NOT NULL, archived_at TEXT NOT NULL, PRIMARY KEY(forum_key,tid));
+CREATE TABLE IF NOT EXISTS rejected(
+ forum_key TEXT NOT NULL, tid TEXT NOT NULL, available_images INTEGER NOT NULL,
+ min_images INTEGER NOT NULL, reason TEXT NOT NULL, rejected_at TEXT NOT NULL,
+ PRIMARY KEY(forum_key,tid), CHECK(available_images >= 0 AND min_images > available_images));
 CREATE TRIGGER IF NOT EXISTS immutable_update BEFORE UPDATE ON archives
  BEGIN SELECT RAISE(ABORT,'successful archives are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS immutable_delete BEFORE DELETE ON archives
  BEGIN SELECT RAISE(ABORT,'successful archives are immutable'); END;
-PRAGMA user_version=1;
+CREATE TRIGGER IF NOT EXISTS rejected_immutable_update BEFORE UPDATE ON rejected
+ BEGIN SELECT RAISE(ABORT,'permanent rejections are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS rejected_immutable_delete BEFORE DELETE ON rejected
+ BEGIN SELECT RAISE(ABORT,'permanent rejections are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS archive_excludes_rejected BEFORE INSERT ON archives
+ WHEN EXISTS(SELECT 1 FROM rejected WHERE forum_key=NEW.forum_key AND tid=NEW.tid)
+ BEGIN SELECT RAISE(ABORT,'post was permanently rejected'); END;
+CREATE TRIGGER IF NOT EXISTS rejected_excludes_archives_pending BEFORE INSERT ON rejected
+ WHEN EXISTS(SELECT 1 FROM archives WHERE forum_key=NEW.forum_key AND tid=NEW.tid)
+ OR EXISTS(SELECT 1 FROM pending WHERE forum_key=NEW.forum_key AND tid=NEW.tid)
+ BEGIN SELECT RAISE(ABORT,'post is already archived or prepared'); END;
+CREATE TRIGGER IF NOT EXISTS pending_excludes_terminal BEFORE INSERT ON pending
+ WHEN EXISTS(SELECT 1 FROM archives WHERE forum_key=NEW.forum_key AND tid=NEW.tid)
+ OR EXISTS(SELECT 1 FROM rejected WHERE forum_key=NEW.forum_key AND tid=NEW.tid)
+ BEGIN SELECT RAISE(ABORT,'post has terminal history'); END;
+PRAGMA user_version=2;
 '''
 
 
@@ -721,14 +807,16 @@ class Store:
         self.db.row_factory = sqlite3.Row
         if existed:
             tables = {x[0] for x in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            if not {'archives', 'pending', 'meta'} <= tables or self.db.execute('PRAGMA user_version').fetchone()[0] != 1:
+            version = self.db.execute('PRAGMA user_version').fetchone()[0]
+            required = {'archives', 'pending', 'meta'} | ({'rejected'} if version == 2 else set())
+            if not required <= tables or version not in {1, 2}:
                 raise ArchiveError('Unknown or incomplete history schema; do not initialize over existing archives')
         self.db.execute('PRAGMA journal_mode=WAL')
         self.db.execute('PRAGMA synchronous=FULL')
-        self.db.executescript(SCHEMA)
+        self.db.executescript('BEGIN IMMEDIATE;\n' + SCHEMA + '\nCOMMIT;')
         identity = self.db.execute("SELECT value FROM meta WHERE key='identity'").fetchone()
         if identity is None:
-            if marker.exists() or self.db.execute('SELECT count(*) FROM archives').fetchone()[0]:
+            if marker.exists() or self.db.execute('SELECT count(*) FROM archives').fetchone()[0] or rejected_count(self.db):
                 raise ArchiveError('Archive identity is missing; restore the history backup')
             identity = [secrets.token_hex(16)]
             with self.db:
@@ -737,7 +825,7 @@ class Store:
             if json.loads(marker.read_text('utf-8')).get('identity') != identity[0]:
                 raise ArchiveError('Output directory belongs to a different history database')
         else:
-            if self.db.execute('SELECT count(*) FROM archives').fetchone()[0]:
+            if self.db.execute('SELECT count(*) FROM archives').fetchone()[0] or rejected_count(self.db):
                 raise ArchiveError('Output identity marker is missing; restore it from backup')
             with marker.open('x', encoding='utf-8') as file:
                 json.dump({'identity': identity[0], 'version': 1}, file)
@@ -752,6 +840,22 @@ class Store:
     def known(self, tid):
         return self.db.execute('SELECT * FROM archives WHERE forum_key=? AND tid=?',
                                (self.config.forum_key, tid)).fetchone()
+
+    def rejection(self, tid):
+        return self.db.execute('SELECT * FROM rejected WHERE forum_key=? AND tid=?',
+                               (self.config.forum_key, tid)).fetchone()
+
+    def terminal(self, tid):
+        return bool(self.known(tid) or self.rejection(tid))
+
+    def reject(self, tid: str, error: InsufficientImages):
+        if self.terminal(tid):
+            return False
+        with self.db:
+            cursor = self.db.execute('INSERT INTO rejected VALUES(?,?,?,?,?,?)',
+                                    (self.config.forum_key, tid, error.available, error.required,
+                                     error.reason, datetime.now(timezone.utc).isoformat(timespec='seconds')))
+        return cursor.rowcount == 1
 
     def path(self, filename: str):
         if Path(filename).name != filename or not filename or filename in {'.', '..'}:
@@ -787,7 +891,7 @@ class Store:
             LOG.info('recovered tid=%s', row['tid'])
 
     def save(self, tid: str, title: str, data: bytes):
-        if self.known(tid):
+        if self.terminal(tid):
             return
         filename = safe_filename(title)
         reserved = lambda name: self.db.execute('SELECT 1 FROM archives WHERE filename=? UNION ALL '
@@ -817,7 +921,7 @@ class Store:
 
 
 def crawl(config: Config):
-    stats = dict(boards=0, pages=0, archived=0, skipped=0, failed=0)
+    stats = dict(boards=0, pages=0, archived=0, rejected=0, skipped=0, failed=0)
     started = time.monotonic()
     with crawl_lock(config):
         store = Store(config)
@@ -859,7 +963,7 @@ def crawl(config: Config):
                         verified = set()
                         if confirmed:
                             uncertain = sticky_ids(document) - explicit
-                            verified.update(tid for tid in uncertain if store.known(tid))
+                            verified.update(tid for tid in uncertain if store.terminal(tid))
                             uncertain -= verified
                             if uncertain and sticky_proof is None:
                                 ordinary, ordinary_url = client.page(board_url(base, style, fid, 1, digest=False), actual)
@@ -890,12 +994,25 @@ def crawl(config: Config):
                                     stats['failed'] += 1
                                     LOG.error('local_archive_missing tid=%s; restore backup, no refetch', tid)
                                 continue
+                            if store.rejection(tid):
+                                stats['skipped'] += 1
+                                continue
                             try:
-                                post, post_url = client.page(thread_url(base, style, tid), actual)
+                                try:
+                                    post, post_url = client.page(thread_url(base, style, tid), actual)
+                                except FetchError as error:
+                                    if config.min_images and error.status in {401, 403, 404, 410}:
+                                        raise InsufficientImages(0, config.min_images, f'post_http_{error.status}') from None
+                                    raise
                                 title, data = extract_post(post, client, post_url)
                                 store.save(tid, title, data)
                                 stats['archived'] += 1
                                 LOG.info('archived tid=%s bytes=%d', tid, len(data))
+                            except InsufficientImages as error:
+                                if store.reject(tid, error):
+                                    stats['rejected'] += 1
+                                LOG.info('permanently_rejected tid=%s available=%d required=%d reason=%s',
+                                         tid, error.available, error.required, error.reason)
                             except ArchiveError as error:
                                 stats['failed'] += 1
                                 LOG.error('post_failed tid=%s reason=%s', tid, error)
@@ -925,6 +1042,13 @@ def readonly_db(config: Config):
         db.close()
 
 
+def rejected_count(db):
+    # Readers can inspect v1 data without writing a migration or starting a crawl.
+    if db.execute('PRAGMA user_version').fetchone()[0] == 1:
+        return 0
+    return db.execute('SELECT count(*) FROM rejected').fetchone()[0]
+
+
 def check_local(config: Config):
     failures, count = [], 0
     with readonly_db(config) as db:
@@ -943,7 +1067,8 @@ def check_local(config: Config):
             if digest != row['sha256'] or path.stat().st_size != row['size']:
                 failures.append('checksum_mismatch:' + row['tid'])
         pending = db.execute('SELECT count(*) FROM pending').fetchone()[0]
-    print(json.dumps(dict(archives=count, pending=pending, errors=failures), ensure_ascii=False))
+        rejected = rejected_count(db)
+    print(json.dumps(dict(archives=count, rejected=rejected, pending=pending, errors=failures), ensure_ascii=False))
     return not failures and not pending
 
 
@@ -1021,6 +1146,7 @@ def make_web_server(config: Config):
                             latest = db.execute("SELECT value FROM meta WHERE key='last_run'").fetchone()
                             cached_state[:] = [time.monotonic(), dict(version=VERSION,
                                 archives=db.execute('SELECT count(*) FROM archives').fetchone()[0],
+                                rejected=rejected_count(db),
                                 pending=db.execute('SELECT count(*) FROM pending').fetchone()[0],
                                 last_run=json.loads(latest[0]) if latest else None)]
                     result = json.dumps(cached_state[1]).encode()

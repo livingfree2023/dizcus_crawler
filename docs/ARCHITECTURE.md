@@ -6,11 +6,12 @@
 flowchart LR
   T[systemd timer / CLI] --> C[配置与进程锁]
   C --> L[首页及精华分页]
-  L --> H{SQLite 成功历史}
-  H -->|已存在| S[跳过正文和媒体]
+  L --> H{SQLite 归档与永久排除历史}
+  H -->|任一终态存在| S[跳过正文和媒体]
   H -->|新帖| P[第一楼提取与白名单净化]
-  P --> I[图片验证与 data URI]
-  I --> A[完整临时 HTML 与 pending]
+  P --> I{图片验证与数量门槛}
+  I -->|少于门槛| R[永久排除元数据]
+  I -->|接受| A[图片内嵌 HTML 与 pending]
   A --> F[不覆盖发布及历史提交]
   W[只读 Web] --> H
   W --> O[本地 HTML]
@@ -22,8 +23,8 @@ flowchart LR
 - `Client`：真实 urllib HTTP 会话、Cookie 域隔离、限速、有限重试、robots 检查、响应体上限；不执行页面脚本或绕过验证。
 - `Document` / `Node`：标准库 HTMLParser 构建受深度限制的树；不尝试实现任意 CSS 引擎。
 - URL 与分页函数：支持 classic、X 和常见伪静态链接。精华依据行内标记或服务器渲染的活动筛选状态；stock 精华页会隐藏图标。无图标置顶通过同板块普通列表另行核验，未知置顶不归档并报告未完整。
-- `Cleaner` / `extract_post`：仅第一楼，标签/属性白名单、去交互及广告、原字节图片内嵌；格式魔数与基本完整性校验不等同于完整图片解码。
-- `Store`：SQLite 历史、输出身份、不可覆盖发布及 pending 恢复。契约详见 `DATABASE.md`。
+- `Cleaner` / `extract_post`：仅第一楼，标签/属性白名单、去交互及广告、原字节图片内嵌；启用 min_images 后隔离单图失败，按不同成功图片源数量决定接受或永久排除，受限图片不请求。格式魔数与基本完整性校验不等同于完整图片解码。
+- `Store`：SQLite 成功/永久排除双终态、输出身份、不可覆盖发布、pending 恢复及 v1→v2 事务迁移。契约详见 `DATABASE.md`。
 - Web：标准库只读服务、分页列表与按记录 ID 阅读，文件流式响应；没有用户输入的抓取接口。
 - systemd：独立日常 oneshot、timer 与可选阅读 service；只有 install/uninstall 修改系统状态。
 
@@ -31,7 +32,7 @@ flowchart LR
 
 Web 页面不执行源站请求，不更新归档，不重算内容。只读 SQLite 连接按请求关闭；归档 HTML 直接从本地流式发送。默认回环监听，远程绑定需要 token 文件，Basic 认证用户名 `archive`；TLS 交由反向代理。
 
-`/api/debug/state` 只返回归档数量、pending 数量、版本及最后一次运行计数，带五秒缓存与互斥，不输出源站 URL、Cookie 或私有路径。`--check` 只读验证完整历史和文件摘要，不做补抓。
+`/api/debug/state` 只返回归档、永久排除、pending 数量、版本及最后一次运行计数，带五秒缓存与互斥，不输出源站 URL、Cookie 或私有路径。`--check` 只读验证完整历史和文件摘要，不做补抓。永久排除不视作运行错误，未知模板/整页临时网络问题仍保持可重试错误。
 
 日志为 JSON 行，含 UTC 时间、级别、trace；抓取关键事件记录 tid、fid、字节数、耗时和失败阶段。DEBUG 通过配置启用，默认 INFO。HTTP 错误只记状态，不输出带参数的完整请求地址。
 

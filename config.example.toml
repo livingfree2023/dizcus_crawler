@@ -12,6 +12,9 @@ ad_hosts = [] # Optional known advertising image hosts, without schemes.
 [archive]
 output_dir = "output"
 database = "data/archive.sqlite3"
+min_images = 1 # Below this many accessible images: permanently skip, no HTML.
+# At/above threshold: save accessible images, omit failed/restricted images.
+# 0 disables this filter and requires every target image (legacy behavior).
 
 [request]
 interval = 2.0

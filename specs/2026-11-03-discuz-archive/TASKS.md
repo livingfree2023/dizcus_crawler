@@ -23,7 +23,7 @@
 
 ## 【Handover 备忘】
 
-用户已授权开发、git init 和首次提交推送，远程地址仅保存于 Git origin 配置。发布范围为脚本、配置模板、测试、必要文档和明确标记的中性原型；运行产物、历史、私有配置、Cookie、token、缓存、日志、系统杂项及本地博客均排除。发布文件已审计，当前提交与远程同步情况以 Git 记录为准，避免文档重复记录易过时的分支状态。单生产脚本 discuz_archive.py 已完成，Python 3.11+ 标准库，1405 行。入口默认抓取，--serve/--check/--install/--uninstall/--dry-run 均提供。示例配置不含真实站点或凭据。
+用户已授权开发、git init 和首次提交推送，远程地址仅保存于 Git origin 配置。发布范围为脚本、配置模板、测试、必要文档和明确标记的中性原型；运行产物、历史、私有配置、Cookie、token、缓存、日志、系统杂项及本地博客均排除。发布文件已审计，当前提交与远程同步情况以 Git 记录为准，避免文档重复记录易过时的分支状态。单生产脚本 discuz_archive.py 已完成，Python 3.11+ 标准库。入口默认抓取，--serve/--check/--install/--uninstall/--dry-run 均提供。示例配置不含真实站点或凭据。后续图片门槛与永久排除需求及最新进度已独立路由至 specs/2026-11-03-image-threshold/。
 
 55 项本地测试在 Python 3.14.7 和 3.12.13 下均通过；其中 real localhost HTTP/CLI/SQLite/文件系统集成与明确标记的中性 fixtures 结合，systemd 的 OS 边界是隔离替身，不声称真实 Linux 安装。3.11 语法检查通过，未在 3.11 解释器运行。只读 Web 浏览器检查已成功，截图为 docs/prototype/preview.jpg；原型列表链接可点开中性独立 HTML。临时预览服务器在交付前关闭，临时探针不入库。
 
