@@ -1,0 +1,36 @@
+# Copy to config.toml. Paths are relative to the configuration file, not the shell.
+[forum]
+key = "my-forum" # Keep stable when switching this forum's mirror/domain.
+url = "https://forum.example.org/index.php"
+style = "auto" # auto | classic | x
+fids = [] # Empty: discover all visible boards. Example: [19, 20].
+exclude_fids = []
+# cookie_file = "cookies.txt" # Optional Netscape-format cookie export, chmod 600.
+drop_selectors = [] # Additional template-specific #id, .class, or tag selectors.
+ad_hosts = [] # Optional known advertising image hosts, without schemes.
+
+[archive]
+output_dir = "output"
+database = "data/archive.sqlite3"
+
+[request]
+interval = 2.0
+timeout = 25
+retries = 2
+max_pages = 10000 # Limit per board; exceeding it reports an incomplete scan.
+max_image_mb = 32
+max_post_mb = 256
+respect_robots = true
+
+[web]
+enabled = true # Include the reader service when installing systemd units.
+host = "127.0.0.1"
+port = 8080
+# token_file = "web-token.txt" # Required for remote binding; at least 24 characters.
+# HTTP Basic username: archive. Use an HTTPS reverse proxy for remote access.
+
+[schedule]
+on_calendar = "*-*-* 03:00:00" # Server local time. Can append a systemd timezone.
+
+[logging]
+level = "INFO" # DEBUG | INFO | WARN | ERROR
