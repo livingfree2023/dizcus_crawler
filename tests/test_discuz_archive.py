@@ -361,10 +361,14 @@ class CrawlHTTPTests(unittest.TestCase):
             archive = self.root / "output" / row["filename"]
             archive.unlink()
             before = state.counts["thread:101"]
-            self.cli(config, expected=None)
+            images_before = {k: v for k, v in state.counts.items() if k.startswith('path:media/')}
+            self.cli(config)
             self.assertEqual(state.counts["thread:101"], before)
+            self.assertEqual({k: v for k, v in state.counts.items() if k.startswith('path:media/')}, images_before)
             self.assertFalse(archive.exists())
-            self.assertNotEqual(self.cli(config, "--check", expected=None).returncode, 0)
+            report = json.loads(self.cli(config, "--check").stdout)
+            self.assertEqual(report['missing_files'], ['101'])
+            self.assertEqual(report['errors'], [])
             self.assertEqual(len(self.records()), 1)
 
     def test_missing_history_with_existing_archives_fails_closed(self):
@@ -539,6 +543,16 @@ class CrawlHTTPTests(unittest.TestCase):
                             urlopen(url + unsafe, timeout=2)
                         self.assertIn(caught.exception.code, {400, 403, 404})
                         caught.exception.close()
+                    self.assertEqual(state.counts, source_counts)
+                    (self.root / "output" / row["filename"]).unlink()
+                    with self.assertRaises(HTTPError) as moved:
+                        urlopen(url + archive_links[0], timeout=2)
+                    self.assertEqual(moved.exception.code, 404)
+                    moved.exception.close()
+                    with urlopen(url, timeout=2) as response:
+                        self.assertEqual(response.status, 200)
+                    with urlopen(url + '/api/debug/state', timeout=2) as response:
+                        self.assertEqual(json.loads(response.read())['archives'], 1)
                     self.assertEqual(state.counts, source_counts)
                 finally:
                     process.terminate()

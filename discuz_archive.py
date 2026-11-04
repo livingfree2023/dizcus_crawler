@@ -38,7 +38,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlsplit, urlunsplit, quo
 from urllib.request import Request, build_opener, HTTPCookieProcessor, HTTPRedirectHandler
 from urllib.robotparser import RobotFileParser
 
-VERSION = '1.2.0'
+VERSION = '1.2.1'
 LOG = logging.getLogger('discuz-archive')
 TRACE = secrets.token_hex(6)
 VOID = {'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr'}
@@ -1212,9 +1212,6 @@ def crawl(config: Config):
                             if known:
                                 stats['skipped'] += 1
                                 LOG.debug('history_skip tid=%s state=archived', tid)
-                                if not store.path(known['filename']).is_file():
-                                    stats['failed'] += 1
-                                    LOG.error('local_archive_missing tid=%s; restore backup, no refetch', tid)
                                 continue
                             if store.rejection(tid):
                                 stats['skipped'] += 1
@@ -1283,7 +1280,7 @@ def rejected_count(db):
 
 
 def check_local(config: Config):
-    failures, count = [], 0
+    failures, missing, count = [], [], 0
     with readonly_db(config) as db:
         identity = db.execute("SELECT value FROM meta WHERE key='identity'").fetchone()
         marker = config.output_dir / '.discuz-archive.json'
@@ -1292,16 +1289,28 @@ def check_local(config: Config):
         for row in db.execute('SELECT * FROM archives'):
             count += 1
             path = config.output_dir / row['filename']
-            if Path(row['filename']).name != row['filename'] or path.is_symlink() or not path.is_file():
-                failures.append('missing_or_unsafe:' + row['tid'])
+            if Path(row['filename']).name != row['filename'] or path.is_symlink():
+                failures.append('unsafe:' + row['tid'])
                 continue
-            with path.open('rb') as file:
-                digest = hashlib.file_digest(file, 'sha256').hexdigest()
-            if digest != row['sha256'] or path.stat().st_size != row['size']:
+            if not path.exists():
+                missing.append(row['tid'])
+                continue
+            if not path.is_file():
+                failures.append('unsafe:' + row['tid'])
+                continue
+            try:
+                with path.open('rb') as file:
+                    digest = hashlib.file_digest(file, 'sha256').hexdigest()
+                    actual_size = os.fstat(file.fileno()).st_size
+            except FileNotFoundError:
+                missing.append(row['tid'])
+                continue
+            if digest != row['sha256'] or actual_size != row['size']:
                 failures.append('checksum_mismatch:' + row['tid'])
         pending = db.execute('SELECT count(*) FROM pending').fetchone()[0]
         rejected = rejected_count(db)
-    print(json.dumps(dict(archives=count, rejected=rejected, pending=pending, errors=failures), ensure_ascii=False))
+    print(json.dumps(dict(archives=count, rejected=rejected, pending=pending,
+                         missing_files=missing, errors=failures), ensure_ascii=False))
     return not failures and not pending
 
 
@@ -1416,22 +1425,28 @@ def make_web_server(config: Config):
                 if row:
                     filename = row['filename']
                     file = config.output_dir / filename
-                    if Path(filename).name != filename or file.is_symlink() or not file.is_file():
-                        raise ArchiveError('Local archive missing; no remote fetch is performed')
+                    if Path(filename).name != filename or file.is_symlink():
+                        raise ArchiveError('Unsafe local archive path')
+                    if not file.is_file():
+                        return self.send_data('此存档已移出本地目录。'.encode(), 'text/plain; charset=utf-8', 404)
                     disposition = 'attachment' if parse_qs(parts.query).get('download') == ['1'] else 'inline'
                     # Stream instead of materializing potentially large embedded GIF archives.
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'text/html; charset=utf-8')
-                    self.send_header('Content-Length', str(file.stat().st_size))
-                    self.send_header('Content-Disposition', disposition + "; filename*=UTF-8''" + quote(filename))
-                    self.send_header('Content-Security-Policy', CSP + '; sandbox')
-                    self.send_header('Cache-Control', 'no-store')
-                    self.send_header('Referrer-Policy', 'no-referrer')
-                    self.send_header('X-Content-Type-Options', 'nosniff')
-                    self.send_header('X-Frame-Options', 'DENY')
-                    self.end_headers()
-                    if self.command != 'HEAD':
-                        with file.open('rb') as src:
+                    try:
+                        src = file.open('rb')
+                    except FileNotFoundError:
+                        return self.send_data('此存档已移出本地目录。'.encode(), 'text/plain; charset=utf-8', 404)
+                    with src:
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'text/html; charset=utf-8')
+                        self.send_header('Content-Length', str(os.fstat(src.fileno()).st_size))
+                        self.send_header('Content-Disposition', disposition + "; filename*=UTF-8''" + quote(filename))
+                        self.send_header('Content-Security-Policy', CSP + '; sandbox')
+                        self.send_header('Cache-Control', 'no-store')
+                        self.send_header('Referrer-Policy', 'no-referrer')
+                        self.send_header('X-Content-Type-Options', 'nosniff')
+                        self.send_header('X-Frame-Options', 'DENY')
+                        self.end_headers()
+                        if self.command != 'HEAD':
                             shutil.copyfileobj(src, self.wfile, length=128*1024)
                     return
             self.send_data(b'Not found', 'text/plain', 404)

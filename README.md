@@ -23,6 +23,10 @@ python3 discuz_archive.py --config config.toml
 
 完成后在 `output/` 中查看归档。每个帖子一个文件，文件名采用首次归档时的标题；同名帖子自动增加标识。
 
+可以将已下载的 HTML 移到其它目录或删除，程序仍按历史跳过这些帖子，正常抓取新帖，不会重新下载。`--check` 会将移走的文件列在 `missing_files`，不因此报错。Web 无法阅读已移走的文件，点击会返回404，服务继续工作。
+
+请保留输出目录中的隐藏文件 `.discuz-archive.json` 和历史数据库：隐藏文件只记录输出目录与历史库的身份绑定，不是帖子索引或密码。仅转移帖子 HTML 即可。
+
 ## 图片数量门槛
 
 在配置现有的 `[archive]` 中设置，例如：
@@ -51,7 +55,9 @@ python3 discuz_archive.py --config config.toml --serve
 ssh -L 8080:127.0.0.1:8080 user@server
 ```
 
-需要远程绑定时，在配置中指定 `web.token_file`，文件内容至少 24 个字符。浏览器登录用户名为 `archive`，密码为文件内容；远程访问应使用 HTTPS 反向代理。
+需要远程绑定时，在配置中指定 `web.token_file`，文件内容至少 24 个字符。浏览器登录用户名固定为 `archive`，密码是文件实际文本内容去掉首尾空白后的值，不是文件路径或密码哈希；远程访问应使用 HTTPS 反向代理。修改密码文件后重启阅读服务。
+
+Caddy仅作反代时，登录仍使用这组后端凭据。若另外配置了Caddy自身的 `basic_auth`，那是另一套认证配置；Caddy配置使用密码哈希，后端token文件使用实际密码文本。避免给同一个入口叠加不同的Basic凭据，配置细节参见 [Caddy官方说明](https://caddyserver.com/docs/caddyfile/directives/basic_auth)。
 
 ## 下载速度与运行进度
 
@@ -114,7 +120,7 @@ sudo python3 discuz_archive.py --uninstall
 - `web.port`：网页阅读端口，默认 8080。
 - `schedule.on_calendar`：systemd 每日执行时间，可指定时区。
 
-请先暂停抓取及阅读服务，再将配置、归档和历史数据一同备份。历史丢失时程序会停止，避免误抓新版；已归档文件丢失时也不会用源站当前内容替换它。
+请先暂停抓取及阅读服务，再将配置、归档和历史数据一同备份。历史或身份文件丢失时程序会停止，避免误抓新版；只移动或删除已归档HTML则不影响后续抓取，也不会用源站当前内容替换它。
 
 ```sh
 python3 discuz_archive.py --config config.toml --check
