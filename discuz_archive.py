@@ -6,7 +6,7 @@ import argparse
 import base64
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import fcntl
@@ -38,7 +38,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlsplit, urlunsplit, quo
 from urllib.request import Request, build_opener, HTTPCookieProcessor, HTTPRedirectHandler
 from urllib.robotparser import RobotFileParser
 
-VERSION = '1.4.0'
+VERSION = '1.5.0'
 LOG = logging.getLogger('discuz-archive')
 TRACE = secrets.token_hex(6)
 VOID = {'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr'}
@@ -1188,10 +1188,10 @@ class Store:
         self.finish(row)
 
 
-def crawl(config: Config):
+def crawl(config: Config, *, _lock_held=False):
     stats = dict(boards=0, pages=0, archived=0, rejected=0, skipped=0, failed=0)
     started = time.monotonic()
-    with crawl_lock(config):
+    with (nullcontext() if _lock_held else crawl_lock(config)):
         progress = Progress(config)
         progress.update(phase='initializing', stats=stats)
         LOG.info('crawl_started min_images=%d interval=%.2f timeout=%.2f retries=%d',
@@ -1449,6 +1449,66 @@ def render_listing(prefix, count, rows, page, size, sort):
     return content+'</nav><footer><details><summary>关于</summary><p>本地首次存档，只读浏览。内容版权归原作者所有。作者：***。</p></details></footer>'
 
 
+def crawl_is_running(config):
+    try:
+        descriptor = os.open(str(config.db_path)+'.lock', os.O_RDONLY)
+    except FileNotFoundError:
+        return False
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return False
+        except BlockingIOError:
+            return True
+    finally:
+        os.close(descriptor)
+
+
+def crawl_status(config):
+    running = crawl_is_running(config)
+    state = read_progress(config)
+    if not state:
+        return dict(running=running, message='正在检查…' if running else '尚无检查记录')
+    stats = state.get('stats') or {}
+    label = '正在检查' if running else ('上次完成' if state.get('status') == 'finished' else '上次检查中断或失败')
+    stamp = str(state.get('updated_at', '')).replace('T', ' ').replace('+00:00', ' UTC')
+    message = (label+' · '+stamp+' · 新增 '+str(stats.get('archived', 0))+
+               ' · 永久跳过 '+str(stats.get('rejected', 0))+' · 失败 '+str(stats.get('failed', 0)))
+    return dict(running=running, message=message)
+
+
+class ManualCrawl:
+    def __init__(self, config):
+        self.config = config
+
+    def start(self):
+        # Reserve the same CLI/timer lock before acknowledging the HTTP request.
+        guard = crawl_lock(self.config)
+        guard.__enter__()
+        try:
+            Progress(self.config).update(phase='queued')
+            worker = threading.Thread(target=self.run, args=(guard,), name='manual-crawl', daemon=True)
+            worker.start()
+        except BaseException:
+            guard.__exit__(*sys.exc_info())
+            raise
+        LOG.info('manual_crawl_accepted')
+
+    def run(self, guard):
+        try:
+            crawl(self.config, _lock_held=True)
+        except Exception as error:
+            LOG.error('manual_crawl_failed type=%s', type(error).__name__)
+            try:
+                state = read_progress(self.config)
+                if not state or state.get('status') == 'running':
+                    Progress(self.config).update(status='failed', phase='failed')
+            except OSError:
+                LOG.exception('manual_crawl_progress_failed')
+        finally:
+            guard.__exit__(None, None, None)
+
+
 def make_web_server(config: Config):
     prefix = normalize_base_path(config.web_base_path)
     token = ''
@@ -1458,6 +1518,8 @@ def make_web_server(config: Config):
             raise ArchiveError('Web token must contain at least 24 characters')
     if config.web_host not in {'127.0.0.1', 'localhost', '::1'} and not token:
         raise ArchiveError('Remote Web binding requires web.token_file; use a local HTTPS reverse proxy')
+    csrf_token = secrets.token_urlsafe(32)
+    manual = ManualCrawl(config)
     cache_lock = threading.Lock()
     cached_state = [0.0, {}]
 
@@ -1473,7 +1535,7 @@ def make_web_server(config: Config):
             self.send_header('Content-Length', str(len(data)))
             self.send_header('Cache-Control', 'no-store')
             self.send_header('X-Content-Type-Options', 'nosniff')
-            self.send_header('Referrer-Policy', 'no-referrer')
+            self.send_header('Referrer-Policy', 'same-origin')
             self.send_header('X-Frame-Options', 'DENY')
             self.send_header('Content-Security-Policy', CSP.replace("form-action 'none'", "form-action 'self'") + "; script-src 'self'; worker-src 'self'; manifest-src 'self'; connect-src 'self'; img-src-elem 'self' data:")
             for key, value in (extra or {}).items():
@@ -1481,6 +1543,58 @@ def make_web_server(config: Config):
             self.end_headers()
             if self.command != 'HEAD':
                 self.wfile.write(data)
+
+        def authenticated(self):
+            if not token:
+                return True
+            expected = 'Basic ' + base64.b64encode(('archive:'+token).encode()).decode()
+            if hmac.compare_digest(self.headers.get('Authorization', ''), expected):
+                return True
+            self.send_data(b'Authentication required', 'text/plain', 401,
+                           {'WWW-Authenticate': 'Basic realm="Archive", charset="UTF-8"'})
+            return False
+
+        def do_POST(self):
+            # Close rejected bodies rather than reinterpreting them as another request.
+            self.close_connection = True
+            if not self.authenticated():
+                return
+            if self.path != prefix+'/api/crawl':
+                return self.send_data(b'Not found', 'text/plain', 404)
+            origin = self.headers.get('Origin')
+            try:
+                parsed = urlsplit(origin) if origin else None
+                valid_origin = not parsed or (parsed.scheme in {'http', 'https'} and
+                    parsed.netloc == self.headers.get('Host') and not parsed.path and
+                    not parsed.query and not parsed.fragment and not parsed.username)
+            except ValueError:
+                valid_origin = False
+            if not valid_origin or self.headers.get('Sec-Fetch-Site', '') not in {'', 'same-origin', 'none'}:
+                return self.send_data(b'Forbidden origin', 'text/plain', 403)
+            try:
+                length = int(self.headers.get('Content-Length', '-1'))
+            except ValueError:
+                length = -1
+            if (self.headers.get('Transfer-Encoding') or not 0 < length <= 1024 or
+                    self.headers.get('Content-Type', '').split(';')[0] != 'application/x-www-form-urlencoded'):
+                return self.send_data(b'Invalid form', 'text/plain', 400)
+            self.connection.settimeout(5)
+            try:
+                body = self.rfile.read(length)
+                values = parse_qs(body.decode('ascii'), keep_blank_values=True)
+            except (OSError, UnicodeError, ValueError):
+                return self.send_data(b'Invalid form', 'text/plain', 400)
+            if (len(body) != length or set(values) != {'csrf'} or len(values['csrf']) != 1 or
+                    not hmac.compare_digest(values['csrf'][0].encode('utf-8'), csrf_token.encode())):
+                return self.send_data(b'Invalid CSRF token', 'text/plain', 403)
+            try:
+                manual.start()
+            except ArchiveError:
+                return self.send_data('已有检查任务正在运行，请返回列表查看。'.encode(), 'text/plain; charset=utf-8', 409)
+            except (OSError, RuntimeError):
+                LOG.exception('manual_crawl_start_failed')
+                return self.send_data(b'Unable to start crawl', 'text/plain', 503)
+            return self.send_data(b'', 'text/plain', 303, {'Location': prefix+'/'})
 
         def do_HEAD(self):
             self.do_GET()
@@ -1494,12 +1608,8 @@ def make_web_server(config: Config):
                 location = prefix + '/' + ('?' + parts.query if parts.query else '')
                 self.send_data(b'', 'text/plain', 308, {'Location': location})
                 return
-            if token:
-                expected = 'Basic ' + base64.b64encode(('archive:'+token).encode()).decode()
-                if not hmac.compare_digest(self.headers.get('Authorization', ''), expected):
-                    self.send_data(b'Authentication required', 'text/plain', 401,
-                                   {'WWW-Authenticate': 'Basic realm="Archive", charset="UTF-8"'})
-                    return
+            if not self.authenticated():
+                return
             try:
                 self.route()
             except (ArchiveError, sqlite3.Error, OSError, ValueError) as error:
@@ -1525,9 +1635,12 @@ def make_web_server(config: Config):
                 return self.send_data(script.encode(), 'text/javascript; charset=utf-8', extra={'Service-Worker-Allowed':prefix+'/'})
             if path == '/app.js':
                 script = "if('serviceWorker' in navigator)navigator.serviceWorker.register("+json.dumps(prefix+'/sw.js')+",{scope:"+json.dumps(prefix+'/')+"}).catch(()=>{});"
+                script += "const status=document.getElementById('crawl-status');if(status){const button=document.getElementById('crawl-button');let busy=button.disabled;setInterval(async()=>{try{const r=await fetch("+json.dumps(prefix+'/api/crawl/state')+",{cache:'no-store'});if(!r.ok)return;const s=await r.json();status.textContent=s.message;button.disabled=s.running;if(busy&&!s.running){location.reload();}busy=s.running;}catch{}},3000);}"
                 return self.send_data(script.encode(), 'text/javascript')
             if path == '/offline':
                 return self.send_data(shell('离线阅读', '<h1>当前处于离线状态</h1><p>请打开已下载的 HTML 存档继续阅读。</p>'))
+            if path == '/api/crawl/state':
+                return self.send_data(json.dumps(crawl_status(config), ensure_ascii=False).encode(), 'application/json')
             if path == '/api/debug/state':
                 with cache_lock:
                     if time.monotonic()-cached_state[0] > 5:
@@ -1554,6 +1667,13 @@ def make_web_server(config: Config):
                         raise
                     count, rows = 0, []
                 content = render_listing(prefix, count, rows, page, size, sort)
+                state = crawl_status(config)
+                controls = ('<section><form method="post" action="'+prefix+'/api/crawl">'
+                    '<input type="hidden" name="csrf" value="'+csrf_token+'">'
+                    '<button id="crawl-button" type="submit"'+(' disabled' if state['running'] else '')+
+                    '>立即检查</button></form><p id="crawl-status" class="muted" role="status">'+
+                    html.escape(state['message'])+'</p></section>')
+                content = content.replace('<form class="toolbar"', controls+'<form class="toolbar"', 1)
                 return self.send_data(shell('帖子存档', content, web=True, base_path=prefix))
             match = re.fullmatch(r'/post/(\d+)', path)
             if match:

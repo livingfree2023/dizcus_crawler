@@ -65,3 +65,9 @@ Manifest、SVG 图标、注册脚本及 Service Worker 都嵌在 Python 中按�
 ## 列表日期与选项
 
 新存档从首楼 authorposton 绝对日期文本或 title 属性提取时间，保留论坛原始精度，不推断时区。HTML 元数据与不可变日期侧表支持事务恢复。阅读路径只查询本地 SQLite；旧日期未知，不回源补录。排序采用白名单 SQL，未知时间始终置后；每页允许20/50/100，翻页保留排序和反代前缀，切换选项回到第一页。
+
+## Web手动抓取
+
+固定POST `/api/crawl`（含配置前缀）沿用Basic鉴权，再校验进程随机CSRF令牌、Origin及Fetch-Site，限制表单为1KiB。不接受目标URL或命令。请求线程先非阻塞获得crawl_lock，再将锁交给后台线程执行同一crawl；定时/CLI冲突409，启动成功303回列表。服务账号已有写权限，无sudo、systemctl或新unit。Web退出会终止后台线程，OS释放锁；进度与pending恢复沿用既有协议。
+
+GET `/api/crawl/state` 只读本地进度与flock状态；即使Web PID仍活着，也不把陈旧running快照判为任务运行。页面每3秒轮询，结束时刷新列表。阅读页Referrer-Policy为same-origin以保留同源POST的Origin，向外站仍不发Referer；归档正文继续no-referrer与sandbox。
