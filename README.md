@@ -59,6 +59,17 @@ ssh -L 8080:127.0.0.1:8080 user@server
 
 Caddy仅作反代时，登录仍使用这组后端凭据。若另外配置了Caddy自身的 `basic_auth`，那是另一套认证配置；Caddy配置使用密码哈希，后端token文件使用实际密码文本。避免给同一个入口叠加不同的Basic凭据，配置细节参见 [Caddy官方说明](https://caddyserver.com/docs/caddyfile/directives/basic_auth)。
 
+使用子路径反代时，在已有 `[web]` 中设置，例如 `base_path = "/archive"`，并让 Caddy 同时转发入口及子路径：
+
+```caddyfile
+@archive path /archive /archive/*
+handle @archive {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+以上放在对应站点块内，端口改成实际配置；不要额外剥离前缀。访问 `/archive/` 后，帖子链接、分页及PWA资源会自动携带该前缀。配置默认空字符串时继续使用独立域名的根目录。修改配置后重启阅读服务。
+
 ## 下载速度与运行进度
 
 图片默认最多 4 路并发，所有图片请求共享至少 0.25 秒的启动间隔；页面请求默认间隔 2 秒。在已有 `[request]` 中调整：

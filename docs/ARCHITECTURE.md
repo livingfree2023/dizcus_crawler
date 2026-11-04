@@ -27,6 +27,7 @@ flowchart LR
 - `Cleaner` / `extract_post`：仅第一楼，标签/属性白名单、去交互及广告、原字节图片内嵌；启用 min_images 后隔离单图失败，按不同成功图片源数量决定接受或永久排除，受限图片不请求。格式魔数与基本完整性校验不等同于完整图片解码。
 - `Store`：SQLite 成功/永久排除双终态、输出身份、不可覆盖发布、pending 恢复及 v1→v2 事务迁移。契约详见 `DATABASE.md`。
 - Web：标准库只读服务、分页列表与按记录 ID 阅读，文件流式响应；没有用户输入的抓取接口。
+- 子路径部署：web.base_path默认空；显式配置时内部strip前缀，生成链接、分页和PWA资源均使用前缀，保留裸路由供本机兼容检查。精确前缀308到尾斜杠，所有内容依旧鉴权。SW缓存以base_path摘要隔离，不清除同源其它实例缓存。
 - systemd：独立日常 oneshot、timer 与可选阅读 service；只有 install/uninstall 修改系统状态。
 
 ## 读写及诊断
@@ -46,6 +47,8 @@ systemd的ExecStart参数使用word quoting，WorkingDirectory单路径指令则
 常用诊断：启动阅读服务后 `curl -s http://127.0.0.1:8080/api/debug/state`（端口按配置，远程鉴权沿用Web设置）。current_run 是当前/最近进程快照，last_run 仍只在整轮扫描结束更新。归档和pending均为0时，可以通过 phase 与 download_completed 确认是否正在处理首帖。
 
 线程池行为参考：[Python concurrent.futures 官方文档](https://docs.python.org/3/library/concurrent.futures.html)。实现使用显式窗口以兼容3.11，不依赖3.14新增的map buffersize。
+
+反代路径以Caddy官方[path matcher](https://caddyserver.com/docs/caddyfile/matchers#path)为准：默认精确匹配，需同时匹配入口和子路径。使用handle原样转发与应用base_path配合；不能只改首页strip而忽略生成的绝对链接。
 
 ## PWA 与离线
 

@@ -38,7 +38,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlsplit, urlunsplit, quo
 from urllib.request import Request, build_opener, HTTPCookieProcessor, HTTPRedirectHandler
 from urllib.robotparser import RobotFileParser
 
-VERSION = '1.2.2'
+VERSION = '1.3.0'
 LOG = logging.getLogger('discuz-archive')
 TRACE = secrets.token_hex(6)
 VOID = {'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr'}
@@ -150,6 +150,7 @@ class Config:
     web_host: str = '127.0.0.1'
     web_port: int = 8080
     web_token_file: Path | None = None
+    web_base_path: str = ''
     schedule: str = '*-*-* 03:00:00'
     log_level: str = 'INFO'
 
@@ -192,6 +193,7 @@ class Config:
             web_enabled=bool(web.get('enabled', True)),
             web_host=str(web.get('host', '127.0.0.1')), web_port=int(web.get('port', 8080)),
             web_token_file=local(web['token_file']) if web.get('token_file') else None,
+            web_base_path=web.get('base_path', ''),
             schedule=str(data.get('schedule', {}).get('on_calendar', '*-*-* 03:00:00')),
             log_level=str(data.get('logging', {}).get('level', 'INFO')).upper())
         if config.style not in {'auto', 'classic', 'x'}:
@@ -209,6 +211,7 @@ class Config:
             raise ArchiveError('Invalid request limits')
         if not 0 < config.web_port < 65536:
             raise ArchiveError('web.port must be between 1 and 65535')
+        config.web_base_path = normalize_base_path(config.web_base_path)
         if config.log_level not in {'DEBUG', 'INFO', 'WARN', 'WARNING', 'ERROR'}:
             raise ArchiveError('Unsupported logging level')
         if config.output_dir == config.db_path.parent:
@@ -825,9 +828,19 @@ nav{display:flex;gap:24px;margin-top:24px;font-size:14px}footer{margin-top:36px;
 CSP = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"
 
 
-def shell(title: str, content: str, *, web=False):
-    extras = ('<link rel="manifest" href="/manifest.webmanifest"><link rel="icon" href="/icon.svg">'
-              '<meta name="theme-color" content="#39634d"><script src="/app.js" defer></script>') if web else ''
+def normalize_base_path(value):
+    if not isinstance(value, str):
+        raise ArchiveError('web.base_path must be a path string')
+    if value in ('', '/'):
+        return ''
+    if not re.fullmatch(r'/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+/?', value):
+        raise ArchiveError('web.base_path requires safe absolute path segments without query or dot segments')
+    return value.rstrip('/')
+
+
+def shell(title: str, content: str, *, web=False, base_path=''):
+    extras = (f'<link rel="manifest" href="{base_path}/manifest.webmanifest"><link rel="icon" href="{base_path}/icon.svg">'
+              f'<meta name="theme-color" content="#39634d"><script src="{base_path}/app.js" defer></script>') if web else ''
     policy = CSP + ("; script-src 'self'; worker-src 'self'; manifest-src 'self'; connect-src 'self'; img-src-elem 'self' data:" if web else '')
     return ('<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width,initial-scale=1">'
@@ -1319,6 +1332,7 @@ SW = b'''const NAME='discuz-shell-v1';self.addEventListener('install',e=>e.waitU
 
 
 def make_web_server(config: Config):
+    prefix = normalize_base_path(config.web_base_path)
     token = ''
     if config.web_token_file:
         token = config.web_token_file.read_text('utf-8').strip()
@@ -1354,6 +1368,14 @@ def make_web_server(config: Config):
             self.do_GET()
 
         def do_GET(self):
+            try:
+                parts = urlsplit(self.path)
+            except ValueError:
+                return self.send_data(b'Invalid request path', 'text/plain', 400)
+            if prefix and parts.path == prefix:
+                location = prefix + '/' + ('?' + parts.query if parts.query else '')
+                self.send_data(b'', 'text/plain', 308, {'Location': location})
+                return
             if token:
                 expected = 'Basic ' + base64.b64encode(('archive:'+token).encode()).decode()
                 if not hmac.compare_digest(self.headers.get('Authorization', ''), expected):
@@ -1369,16 +1391,23 @@ def make_web_server(config: Config):
         def route(self):
             parts = urlsplit(self.path)
             path = parts.path
+            if prefix and path.startswith(prefix + '/'):
+                path = path[len(prefix):]
             if path == '/icon.svg':
                 return self.send_data(ICON, 'image/svg+xml')
             if path == '/manifest.webmanifest':
                 return self.send_data(json.dumps({'name':'帖子存档','short_name':'存档','lang':'zh-CN',
-                    'start_url':'/','display':'standalone','background_color':'#f7f8f5','theme_color':'#39634d',
-                    'icons':[{'src':'/icon.svg','sizes':'any','type':'image/svg+xml','purpose':'any'}]}, ensure_ascii=False).encode(), 'application/manifest+json')
+                    'start_url':prefix+'/','scope':prefix+'/','display':'standalone','background_color':'#f7f8f5','theme_color':'#39634d',
+                    'icons':[{'src':prefix+'/icon.svg','sizes':'any','type':'image/svg+xml','purpose':'any'}]}, ensure_ascii=False).encode(), 'application/manifest+json')
             if path == '/sw.js':
-                return self.send_data(SW, 'text/javascript; charset=utf-8', extra={'Service-Worker-Allowed':'/'})
+                namespace = 'discuz-shell-' + hashlib.sha256(prefix.encode()).hexdigest()[:12] + '-'
+                script = SW.decode().replace("discuz-shell-v1", namespace+'v1').replace("startsWith('discuz-shell-')", "startsWith('"+namespace+"')")
+                for resource in ('/offline', '/icon.svg'):
+                    script = script.replace("'"+resource+"'", "'"+prefix+resource+"'")
+                return self.send_data(script.encode(), 'text/javascript; charset=utf-8', extra={'Service-Worker-Allowed':prefix+'/'})
             if path == '/app.js':
-                return self.send_data(b"if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js').catch(()=>{});", 'text/javascript')
+                script = "if('serviceWorker' in navigator)navigator.serviceWorker.register("+json.dumps(prefix+'/sw.js')+",{scope:"+json.dumps(prefix+'/')+"}).catch(()=>{});"
+                return self.send_data(script.encode(), 'text/javascript')
             if path == '/offline':
                 return self.send_data(shell('离线阅读', '<h1>当前处于离线状态</h1><p>请打开已下载的 HTML 存档继续阅读。</p>'))
             if path == '/api/debug/state':
@@ -1409,15 +1438,15 @@ def make_web_server(config: Config):
                         raise
                     count, rows = 0, []
                 content = '<p class="label">离线阅读</p><h1>帖子存档</h1><p class="muted">共 ' + str(count) + ' 篇</p><ul class="posts">'
-                content += ''.join('<li><a href="/post/' + str(r['id']) + '"><span>' + html.escape(r['title']) +
+                content += ''.join('<li><a href="' + prefix + '/post/' + str(r['id']) + '"><span>' + html.escape(r['title']) +
                                    '</span><time>' + html.escape(r['archived_at'][:10]) + '</time></a></li>' for r in rows)
                 content += '</ul>' + ('<p class="muted">还没有存档。</p>' if not count else '') + '<nav>'
                 if page > 1:
-                    content += f'<a href="/?page={page-1}">上一页</a>'
+                    content += f'<a href="{prefix}/?page={page-1}">上一页</a>'
                 if page*50 < count:
-                    content += f'<a href="/?page={page+1}">下一页</a>'
+                    content += f'<a href="{prefix}/?page={page+1}">下一页</a>'
                 content += '</nav><footer><details><summary>关于</summary><p>本地首次存档，只读浏览。内容版权归原作者所有。作者：***。</p></details></footer>'
-                return self.send_data(shell('帖子存档', content, web=True))
+                return self.send_data(shell('帖子存档', content, web=True, base_path=prefix))
             match = re.fullmatch(r'/post/(\d+)', path)
             if match:
                 with readonly_db(config) as db:

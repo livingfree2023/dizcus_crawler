@@ -6,8 +6,9 @@
 - 规格与进度：`specs/2026-11-03-discuz-archive/`。
 - 图片阈值与永久跳过：`specs/2026-11-03-image-threshold/`。
 - 实时诊断、有限图片并发与安装权限排障：`specs/2026-11-03-live-progress/`。
-- 已归档HTML移出与历史独立：`specs/2026-11-03-moved-archives/`（当前特性）。
+- 已归档HTML移出与历史独立：`specs/2026-11-03-moved-archives/`。
 - systemd路径语法修复：`specs/2026-11-03-systemd-path/`。
+- Web子路径反代：`specs/2026-11-03-web-base-path/`（当前特性）。
 - 抓取历史与首次存档契约：`docs/DATABASE.md`。
 - 架构、约定与验证：`docs/ARCHITECTURE.md`、`docs/CONVENTIONS.md`、`docs/TESTING.md`。
 - 静态样例：`docs/prototype/output/`。其中内容为明确标注的中性测试素材，不代表真实抓取成功。

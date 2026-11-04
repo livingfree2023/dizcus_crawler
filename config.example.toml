@@ -31,6 +31,7 @@ respect_robots = true
 enabled = true # Include the reader service when installing systemd units.
 host = "127.0.0.1"
 port = 8080
+base_path = "" # Subpath proxy example: "/archive"; forward this path and /archive/*.
 # token_file = "web-token.txt" # Required for remote binding; at least 24 characters.
 # HTTP Basic username: archive. Use an HTTPS reverse proxy for remote access.
 
