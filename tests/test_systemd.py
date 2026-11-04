@@ -60,6 +60,15 @@ class UnitBuildTests(unittest.TestCase):
             'discuz-archive.service', 'discuz-archive.timer',
         })
 
+    def test_working_directory_is_a_single_unquoted_path(self):
+        crawler = self.units()['discuz-archive.service']
+        self.assertIn('WorkingDirectory=/opt/archive\\x20space\n', crawler)
+        self.assertNotIn('WorkingDirectory="', crawler)
+        self.assertEqual(archive.unit_path('/opt/a b%"\\c'), '/opt/a\\x20b%%\\x22\\x5cc')
+        for path in ('/opt/a\nb', '/opt/a\tb', '/opt/a\x00b'):
+            with self.assertRaises(ValueError):
+                archive.unit_path(path)
+
     def test_rejects_root_and_configuration_injection(self):
         for user in ('root', 'root\nUser=archive', 'x\x00y', 'user;command'):
             with self.subTest(user=user), self.assertRaises(ValueError):
@@ -223,6 +232,14 @@ class InstallerLifecycleTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.install(uninstall=True)
         self.assertEqual({p.name: p.read_bytes() for p in self.units.iterdir()}, originals)
+
+    def test_unit_validation_failure_reports_actual_reason_without_installing(self):
+        self.run.side_effect = [subprocess.CompletedProcess([], 0, b'', b''),
+                               subprocess.CompletedProcess([], 1, b'', b'WorkingDirectory path is not absolute')]
+        with self.assertRaisesRegex(RuntimeError, 'WorkingDirectory path is not absolute'):
+            self.install()
+        self.assertEqual(list(self.units.iterdir()), [])
+        self.assertEqual(self.calls, [])
 
 
 class ServiceAccessTests(unittest.TestCase):

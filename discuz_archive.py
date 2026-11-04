@@ -38,7 +38,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlsplit, urlunsplit, quo
 from urllib.request import Request, build_opener, HTTPCookieProcessor, HTTPRedirectHandler
 from urllib.robotparser import RobotFileParser
 
-VERSION = '1.2.1'
+VERSION = '1.2.2'
 LOG = logging.getLogger('discuz-archive')
 TRACE = secrets.token_hex(6)
 VOID = {'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr'}
@@ -1537,6 +1537,13 @@ def unit_quote(value: str) -> str:
     return '"' + value.replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%') + '"'
 
 
+def unit_path(value: str) -> str:
+    """Encode a single path directive; outer quotes are literal here."""
+    if any(ord(c) < 32 or ord(c) == 127 for c in value):
+        raise ValueError('systemd paths must not contain control characters')
+    return value.replace('\\', '\\x5c').replace(' ', '\\x20').replace('"', '\\x22').replace('%', '%%')
+
+
 def build_units(config_path: Path, script_path: Path, python_path: str,
                 run_user: str, calendar: str, web_enabled: bool) -> dict[str, str]:
     """Generate unit files without making any system changes."""
@@ -1553,7 +1560,7 @@ def build_units(config_path: Path, script_path: Path, python_path: str,
     command = ':' + ' '.join(unit_quote(str(x)) for x in
                              (python_path, script_path, '--config', config_path))
     common = (f'User={run_user}\n'
-              f'WorkingDirectory={unit_quote(str(config_path.parent))}\n'
+              f'WorkingDirectory={unit_path(str(config_path.parent))}\n'
               'UMask=0077\n'
               'NoNewPrivileges=true\n'
               'PrivateTmp=true\n'
@@ -1866,7 +1873,10 @@ def install_service(config, config_path: Path, *, uninstall: bool = False,
             result = subprocess.run([analyze, 'verify', *check_paths],
                                     capture_output=True, timeout=30)
             if result.returncode:
-                raise RuntimeError('Generated systemd unit validation failed; no unit files were changed')
+                detail = result.stderr or result.stdout or f'exit={result.returncode}'
+                if isinstance(detail, bytes):
+                    detail = detail.decode('utf-8', errors='replace')
+                raise RuntimeError('Generated systemd unit validation failed; no unit files were changed: ' + detail[:4000])
     # Stop old work before replacing units; reinstalling never races a running crawl.
     for name in ('discuz-archive.timer', 'discuz-archive-web.service'):
         if name in existing:

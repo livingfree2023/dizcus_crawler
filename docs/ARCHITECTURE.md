@@ -39,6 +39,8 @@ Web 页面不执行源站请求，不更新归档，不重算内容。只读 SQL
 
 安装访问探针在真实服务账号下检查文件读取、解释器执行、父目录穿行及状态写入。若目标解释器不可启动，可用系统Python只读诊断路径，但不能以备用解释器的成功误判原解释器可运行。只格式化结构化失败路径，不回显 launcher stdout/stderr 或敏感文件内容；诊断结果只进入本地安装日志，不进入Web接口。
 
+systemd的ExecStart参数使用word quoting，WorkingDirectory单路径指令则使用不加外层引号的C风格转义；二者不能复用同一个序列化函数。真实Ubuntu探针已验证普通路径与空格/百分号路径。unit校验失败保留有限长度的校验器实际错误，不再只输出泛化原因。
+
 日志为 JSON 行，含 UTC 时间、级别、trace；抓取关键事件记录 tid、fid、字节数、耗时和失败阶段。DEBUG 通过配置启用，默认 INFO。HTTP 错误只记状态，不输出带参数的完整请求地址。
 
 常用诊断：启动阅读服务后 `curl -s http://127.0.0.1:8080/api/debug/state`（端口按配置，远程鉴权沿用Web设置）。current_run 是当前/最近进程快照，last_run 仍只在整轮扫描结束更新。归档和pending均为0时，可以通过 phase 与 download_completed 确认是否正在处理首帖。
