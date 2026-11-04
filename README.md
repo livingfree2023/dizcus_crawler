@@ -53,6 +53,25 @@ ssh -L 8080:127.0.0.1:8080 user@server
 
 需要远程绑定时，在配置中指定 `web.token_file`，文件内容至少 24 个字符。浏览器登录用户名为 `archive`，密码为文件内容；远程访问应使用 HTTPS 反向代理。
 
+## 下载速度与运行进度
+
+图片默认最多 4 路并发，所有图片请求共享至少 0.25 秒的启动间隔；页面请求默认间隔 2 秒。在已有 `[request]` 中调整：
+
+```toml
+image_workers = 4
+image_interval = 0.25
+```
+
+`image_workers = 1` 恢复串行，最大允许 8。图片在存档中保持原有顺序。
+
+默认 INFO 日志会显示启动、板块分页、当前帖子和图片下载进度，写入 stderr。合并终端输出并保存日志：
+
+```sh
+python3 -u discuz_archive.py --config config.toml 2>&1 | tee crawler.log
+```
+
+需要更详细的请求类型、等待和重试信息时，将已有 `[logging]` 中的 `level` 改成 `"DEBUG"` 后重启抓取。只读阅读服务的诊断接口会返回当前阶段、帖子和实时下载计数；具体操作见[运行诊断说明](docs/ARCHITECTURE.md)。更新脚本后需要重启已在运行的抓取和阅读进程。
+
 ## Debian / Ubuntu 每日运行
 
 需要使用 systemd 的 Debian/Ubuntu，且 Python 版本至少为 3.11。将脚本与配置放在持久目录中，例如 `/opt/discuz-archive/`，运行账号需要读取脚本、配置及可选 Cookie，并可写入归档和历史目录。
@@ -66,6 +85,10 @@ sudo python3 discuz_archive.py --config "$PWD/config.toml" --install
 默认每天按服务器本地时间 **03:00** 执行，关机期间错过的任务会补跑。修改配置中的 `schedule.on_calendar` 后，再运行一次 `--install` 应用新时间。默认同时启用 Web 阅读服务；设 `web.enabled = false` 可仅安装定时抓取。
 
 服务以调用 sudo 的普通用户运行；直接以 root 安装时创建专用账号。权限预检不通过会明确停止，不会让服务以 root 抓取。
+
+如果安装提示权限不足，先确认项目与 Python 都位于服务账号可访问的位置。`/root` 下的项目、root 专属 pyenv/venv 通常不适合直接作为非 root 服务运行。使用公共位置的 Python 3.11+，将整个项目连同归档和历史复制到可访问的持久目录，再给服务账号读取配置及可选 Cookie/token 的权限。复制前先停止抓取与阅读进程，保留原目录作为备份。
+
+新版错误会列出实际服务账号、无法穿行的父目录、不可读文件或不可写目录。若配置中保存的是旧位置的绝对路径，也要同步迁移对应文件及配置路径。服务不会自动放宽整个家目录权限或接管其它普通账号的数据。
 
 ```sh
 systemctl status discuz-archive.timer
@@ -85,7 +108,9 @@ sudo python3 discuz_archive.py --uninstall
 - `forum.fids`：要扫描的板块，留空自动发现。
 - `forum.cookie_file`：可选 Netscape 格式 Cookie 文件；请设置为仅本人可读。
 - `archive.min_images`：可获取正文图片的最低数量，不足永久跳过。
-- `request.interval`：请求间隔，默认 2 秒。
+- `request.interval`：页面请求间隔，默认 2 秒。
+- `request.image_workers`：图片并发数量，默认 4。
+- `request.image_interval`：图片请求共享的启动间隔，默认 0.25 秒。
 - `web.port`：网页阅读端口，默认 8080。
 - `schedule.on_calendar`：systemd 每日执行时间，可指定时区。
 

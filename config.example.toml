@@ -18,6 +18,8 @@ min_images = 1 # Below this many accessible images: permanently skip, no HTML.
 
 [request]
 interval = 2.0
+image_workers = 4 # 1 = sequential; allowed range 1..8.
+image_interval = 0.25 # Shared minimum interval between image request starts.
 timeout = 25
 retries = 2
 max_pages = 10000 # Limit per board; exceeding it reports an incomplete scan.

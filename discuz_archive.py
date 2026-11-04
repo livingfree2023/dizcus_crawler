@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import base64
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -37,7 +38,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlsplit, urlunsplit, quo
 from urllib.request import Request, build_opener, HTTPCookieProcessor, HTTPRedirectHandler
 from urllib.robotparser import RobotFileParser
 
-VERSION = '1.1.0'
+VERSION = '1.2.0'
 LOG = logging.getLogger('discuz-archive')
 TRACE = secrets.token_hex(6)
 VOID = {'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr'}
@@ -66,6 +67,56 @@ class JsonLog(logging.Formatter):
                            'event': record.getMessage()}, ensure_ascii=False)
 
 
+class Progress:
+    def __init__(self, config):
+        self.path = config.db_path.parent / 'progress.json'
+        self.state = dict(status='running', pid=os.getpid(), trace=TRACE,
+                          started_at=datetime.now(timezone.utc).isoformat())
+        self.lock = threading.Lock()
+
+    def update(self, **fields):
+        with self.lock:
+            self._update(**fields)
+
+    def _update(self, **fields):
+        allowed = {'status', 'phase', 'fid', 'tid', 'image_attempts', 'image_available',
+                   'image_failed', 'stats', 'request_kind', 'request_attempt', 'wait_seconds',
+                   'download_total', 'download_completed', 'download_failed'}
+        self.state.update({k: v for k, v in fields.items() if k in allowed})
+        self.state['updated_at'] = datetime.now(timezone.utc).isoformat()
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd, temporary = tempfile.mkstemp(prefix='.progress-', dir=self.path.parent)
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as file:
+                json.dump(self.state, file)
+            os.replace(temporary, self.path)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+
+
+def read_progress(config):
+    try:
+        state = json.loads((config.db_path.parent / 'progress.json').read_text('utf-8'))
+        if not isinstance(state, dict):
+            return None
+        pid = state.get('pid')
+        if type(pid) is not int or pid <= 0:
+            return None
+        try:
+            os.kill(pid, 0)
+            alive = True
+        except ProcessLookupError:
+            alive = False
+        except PermissionError:
+            alive = True
+        state['process_alive'] = alive
+        if not alive and state.get('status') == 'running':
+            state['status'] = 'interrupted'
+        return state
+    except (OSError, ValueError, TypeError):
+        return None
+
+
 def http_url(url: str) -> str:
     p = urlsplit(html.unescape(url.strip()))
     if p.scheme not in ('http', 'https') or not p.hostname or p.username or p.password:
@@ -92,6 +143,8 @@ class Config:
     max_image_bytes: int = 32 * 1024 * 1024
     max_post_bytes: int = 256 * 1024 * 1024
     min_images: int = 0
+    image_workers: int = 4
+    image_interval: float = 0.25
     respect_robots: bool = True
     web_enabled: bool = True
     web_host: str = '127.0.0.1'
@@ -133,6 +186,8 @@ class Config:
             max_image_bytes=int(request.get('max_image_mb', 32)) * 1024 * 1024,
             max_post_bytes=int(request.get('max_post_mb', 256)) * 1024 * 1024,
             min_images=minimum,
+            image_workers=request.get('image_workers', 4),
+            image_interval=float(request.get('image_interval', 0 if request.get('interval') == 0 else 0.25)),
             respect_robots=bool(request.get('respect_robots', True)),
             web_enabled=bool(web.get('enabled', True)),
             web_host=str(web.get('host', '127.0.0.1')), web_port=int(web.get('port', 8080)),
@@ -141,6 +196,10 @@ class Config:
             log_level=str(data.get('logging', {}).get('level', 'INFO')).upper())
         if config.style not in {'auto', 'classic', 'x'}:
             raise ArchiveError('forum.style must be auto, classic, or x')
+        if type(config.image_workers) is not int or not 1 <= config.image_workers <= 8:
+            raise ArchiveError('request.image_workers must be an integer from 1 to 8')
+        if not math.isfinite(config.image_interval) or config.image_interval < 0:
+            raise ArchiveError('request.image_interval must be finite and nonnegative')
         if any(not x.isdecimal() or int(x) < 1 for x in config.fids + config.exclude_fids):
             raise ArchiveError('Board IDs must be positive integers')
         if not (math.isfinite(config.interval) and math.isfinite(config.timeout)
@@ -236,8 +295,15 @@ class Client:
             jar = MozillaCookieJar(str(config.cookie_file))
             jar.load(ignore_discard=True)
         self.opener = build_opener(SafeRedirect(), HTTPCookieProcessor(jar))
+        self.jar = jar
+        self.owner_thread = threading.get_ident()
+        self.thread_local = threading.local()
+        self.rate_lock = threading.Lock()
+        self.robots_lock = threading.Lock()
         self.last_request = 0.0
         self.robots = {}
+        self.progress = None
+        self.request_kind = 'page'
 
     def _get(self, url: str, limit: int, referer: str = ''):
         url = http_url(url)
@@ -245,13 +311,24 @@ class Client:
         if referer:
             headers['Referer'] = referer
         for attempt in range(self.config.retries + 1):
-            wait = self.config.interval - (time.monotonic() - self.last_request)
-            if wait > 0:
-                time.sleep(wait)
-            self.last_request = time.monotonic()
+            kind = 'robots' if urlsplit(url).path.endswith('/robots.txt') else self.request_kind
+            interval = self.config.image_interval if kind == 'image' else self.config.interval
+            with self.rate_lock:
+                wait = interval - (time.monotonic() - self.last_request)
+                if wait > 0:
+                    time.sleep(wait)
+                self.last_request = time.monotonic()
+            if self.progress:
+                self.progress.update(request_kind=kind, request_attempt=attempt+1, wait_seconds=round(max(0, wait), 2))
+            LOG.debug('http_start kind=%s attempt=%d wait_seconds=%.2f', kind, attempt+1, max(0, wait))
             started = time.monotonic()
             try:
-                with self.opener.open(Request(url, headers=headers), timeout=self.config.timeout) as response:
+                opener = self.opener
+                if threading.get_ident() != self.owner_thread:
+                    if not hasattr(self.thread_local, 'opener'):
+                        self.thread_local.opener = build_opener(SafeRedirect(), HTTPCookieProcessor(self.jar))
+                    opener = self.thread_local.opener
+                with opener.open(Request(url, headers=headers), timeout=self.config.timeout) as response:
                     if response.headers.get('Content-Encoding', 'identity').lower() not in ('identity', ''):
                         raise ArchiveError('Unexpected compressed response')
                     body = response.read(limit + 1)
@@ -260,11 +337,12 @@ class Client:
                     declared_length = response.headers.get('Content-Length', '')
                     if declared_length.isdecimal() and int(declared_length) != len(body):
                         raise ArchiveError('Incomplete HTTP response body')
-                    LOG.debug('http status=%d bytes=%d elapsed_ms=%d', response.status, len(body),
+                    LOG.debug('http kind=%s status=%d bytes=%d elapsed_ms=%d', kind, response.status, len(body),
                               int((time.monotonic()-started)*1000))
                     return body, response.headers, http_url(response.url)
             except HTTPError as error:
                 status = error.code
+                LOG.debug('http_error kind=%s status=%d attempt=%d', kind, status, attempt+1)
                 retry_after = error.headers.get('Retry-After', '')
                 error.close()
                 if status not in {429, 500, 502, 503, 504} or attempt == self.config.retries:
@@ -273,6 +351,7 @@ class Client:
                     raise ArchiveError('Server requested a longer pause; retry on a later run') from None
                 time.sleep(max(2 ** attempt, int(retry_after) if retry_after.isdecimal() else 0))
             except (URLError, TimeoutError, OSError, HTTPException):
+                LOG.debug('http_network_error kind=%s attempt=%d', kind, attempt+1)
                 if attempt == self.config.retries:
                     raise ArchiveError('Network request failed or timed out') from None
                 time.sleep(2 ** attempt)
@@ -282,22 +361,26 @@ class Client:
         url = http_url(url)
         origin = urlunsplit((*urlsplit(url)[:2], '', '', ''))
         if self.config.respect_robots:
-            if origin not in self.robots:
-                parser = RobotFileParser()
-                try:
-                    body, _, _ = self._get(origin + '/robots.txt', 512 * 1024)
-                    parser.parse(body.decode('utf-8', errors='replace').splitlines())
-                except ArchiveError as error:
-                    if 'status=404' in str(error) or 'status=410' in str(error):
-                        parser.parse(['User-agent: *', 'Allow: /'])
-                    elif 'status=401' in str(error) or 'status=403' in str(error):
-                        parser.parse(['User-agent: *', 'Disallow: /'])
-                    else:
-                        raise ArchiveError('Cannot verify robots.txt; request skipped') from None
-                self.robots[origin] = parser
-            if not self.robots[origin].can_fetch(self.agent, url):
-                raise ArchiveError('robots.txt disallows this request')
+            with self.robots_lock:
+                self._check_robots(origin, url)
         return self._get(url, limit, referer)
+
+    def _check_robots(self, origin, url):
+        if origin not in self.robots:
+            parser = RobotFileParser()
+            try:
+                body, _, _ = self._get(origin + '/robots.txt', 512 * 1024)
+                parser.parse(body.decode('utf-8', errors='replace').splitlines())
+            except ArchiveError as error:
+                if 'status=404' in str(error) or 'status=410' in str(error):
+                    parser.parse(['User-agent: *', 'Allow: /'])
+                elif 'status=401' in str(error) or 'status=403' in str(error):
+                    parser.parse(['User-agent: *', 'Disallow: /'])
+                else:
+                    raise ArchiveError('Cannot verify robots.txt; request skipped') from None
+            self.robots[origin] = parser
+        if not self.robots[origin].can_fetch(self.agent, url):
+            raise ArchiveError('robots.txt disallows this request')
 
     def page(self, url: str, referer: str = ''):
         raw, headers, final = self.fetch(url, 8 * 1024 * 1024, referer)
@@ -510,12 +593,109 @@ def image_type(data: bytes):
     raise ArchiveError('Image is incomplete or has an unsupported/invalid format')
 
 
+class ImageWindow:
+    """At most N queued/results at once; preserve article order without bulk buffering."""
+    def __init__(self, client, page, urls):
+        self.client, self.page = client, page
+        self.remaining = deque(urls)
+        self.pending = {}
+        self.total, self.completed, self.failed = len(urls), 0, 0
+        self.lock = threading.Lock()
+        self.pool = ThreadPoolExecutor(max_workers=client.config.image_workers,
+                                       thread_name_prefix='discuz-image')
+        client.request_kind = 'image'
+        if client.progress:
+            client.progress.update(phase='images', download_total=self.total,
+                                   download_completed=0, download_failed=0)
+        LOG.info('image_batch_started total=%d workers=%d', self.total, client.config.image_workers)
+        for _ in range(client.config.image_workers):
+            self.submit_next()
+
+    def submit_next(self):
+        url = self.remaining.popleft() if self.remaining else None
+        if url is not None:
+            self.pending[url] = self.pool.submit(self.download, url)
+
+    def download(self, url):
+        failed = False
+        try:
+            result = self.client.fetch(url, self.client.config.max_image_bytes, self.page)
+            image_type(result[0])
+            return result
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            with self.lock:
+                self.completed += 1
+                self.failed += int(failed)
+                LOG.info('image_download_progress completed=%d total=%d failed=%d',
+                         self.completed, self.total, self.failed)
+                if self.client.progress:
+                    self.client.progress.update(download_completed=self.completed, download_failed=self.failed)
+
+    def get(self, url):
+        future = self.pending.pop(url, None)
+        if future is None:
+            if url in self.remaining:
+                self.remaining.remove(url)
+            return self.pool.submit(self.download, url).result()
+        try:
+            return future.result()
+        finally:
+            self.submit_next()
+
+    def close(self):
+        self.pool.shutdown(wait=True, cancel_futures=True)
+
+
 class Cleaner:
     def __init__(self, client: Client, page: str):
         self.client, self.config, self.page = client, client.config, page
         self.images = {}
         self.failed_sources = set()
         self.total_bytes = 0
+        self.attempts = 0
+        self.window = None
+
+    def prepare(self, body, container):
+        if self.config.image_workers == 1:
+            return
+        included = {id(n) for n in body.walk()}
+        urls = []
+        nodes = list(body.walk()) + [n for n in container.walk() if id(n) not in included]
+        for node in nodes:
+            if node.tag != 'img' or not (id(node) in included or node.attrs.get('id', '').startswith('aimg_') or node.attrs.get('aid')):
+                continue
+            scope = [node]
+            for ancestor in node.ancestors():
+                scope.append(ancestor)
+                if ancestor is container:
+                    break
+            if any(discard(n, self.config) or needs_access(n) for n in scope):
+                continue
+            a = node.attrs
+            source = next((a.get(k) for k in ('zoomfile','file','data-original','data-src','src') if a.get(k)), '')
+            if (not source or source.startswith('data:') or '/smiley/' in source or '/smilies/' in source
+                    or a.get('width') == '1' and a.get('height') == '1'):
+                continue
+            try:
+                url = http_url(urljoin(self.page, source))
+                if re.search(r'(?:^|/)(?:static/image/common|images/default)/(?:none|loading|imgloading|placeholder)\.(?:gif|png)$', urlsplit(url).path, re.I):
+                    continue
+                host = urlsplit(url).hostname or ''
+                if any(host == h or host.endswith('.'+h) for h in self.config.ad_hosts):
+                    continue
+                if url not in urls:
+                    urls.append(url)
+            except (ArchiveError, ValueError):
+                continue
+        if urls:
+            self.window = ImageWindow(self.client, self.page, urls[:1000])
+
+    def close(self):
+        if self.window:
+            self.window.close()
 
     def image(self, node: Node):
         # Failed sources are cached too: repeated broken tags must not multiply
@@ -523,6 +703,14 @@ class Cleaner:
         source = next((node.attrs.get(key) for key in
                        ('zoomfile', 'file', 'data-original', 'data-src', 'src') if node.attrs.get(key)), '')
         attempt_key = source
+        self.attempts += 1
+        identity = link_identity(self.page)
+        tid = identity[1] if identity else 'unknown'
+        progress = getattr(self.client, 'progress', None)
+        self.client.request_kind = 'image'
+        LOG.info('image_started tid=%s index=%d', tid, self.attempts)
+        if progress:
+            progress.update(phase='images', image_attempts=self.attempts)
         try:
             if not source.startswith('data:'):
                 attempt_key = http_url(urljoin(self.page, source))
@@ -530,14 +718,20 @@ class Cleaner:
                 return ''
             return self._image(node)
         except (ArchiveError, ValueError) as error:
+            self.failed_sources.add(attempt_key)
             if not self.config.min_images:
                 raise
-            self.failed_sources.add(attempt_key)
             identity = link_identity(self.page)
             LOG.warning('image_unavailable tid=%s status=%s reason_type=%s available=%d',
                         identity[1] if identity else 'unknown', getattr(error, 'status', None),
                         type(error).__name__, len(self.images))
             return ''
+        finally:
+            LOG.info('image_progress tid=%s processed=%d available=%d failed=%d bytes=%d',
+                     tid, self.attempts, len(self.images), len(self.failed_sources), self.total_bytes)
+            if progress:
+                progress.update(image_attempts=self.attempts, image_available=len(self.images),
+                                image_failed=len(self.failed_sources))
 
     def _image(self, node: Node):
         a = node.attrs
@@ -570,7 +764,8 @@ class Cleaner:
             if len(self.images) >= 1000:
                 raise ArchiveError('Image count limit exceeded')
             if data is None:
-                data, _, _ = self.client.fetch(source, self.config.max_image_bytes, self.page)
+                data, _, _ = (self.window.get(source) if self.window else
+                              self.client.fetch(source, self.config.max_image_bytes, self.page))
             mime = image_type(data)
             if (self.total_bytes + len(data)) * 4 // 3 > self.config.max_post_bytes:
                 raise ArchiveError('Post exceeds configured archive size limit')
@@ -691,14 +886,18 @@ def extract_post(root: Node, client: Client, page: str):
             if ancestor is container:
                 break
     protected_body = any(needs_access(n) for n in body_scope)
-    content = '' if client.config.min_images and protected_body else cleaner.render(body)
-    included = {id(n) for n in body.walk()}
-    # Discuz sometimes stores original image attachments beside postmessage, within the same floor.
-    for node in container.walk():
-        if node.tag == 'img' and id(node) not in included and (
-                node.attrs.get('id', '').startswith('aimg_') or node.attrs.get('aid')):
-            if not any(discard(n, client.config) or needs_access(n) for n in [node, *node.ancestors()] if n is not container.parent):
-                content += cleaner.image(node)
+    try:
+        cleaner.prepare(body, container)
+        content = '' if client.config.min_images and protected_body else cleaner.render(body)
+        included = {id(n) for n in body.walk()}
+        # Discuz sometimes stores original image attachments beside postmessage, within the same floor.
+        for node in container.walk():
+            if node.tag == 'img' and id(node) not in included and (
+                    node.attrs.get('id', '').startswith('aimg_') or node.attrs.get('aid')):
+                if not any(discard(n, client.config) or needs_access(n) for n in [node, *node.ancestors()] if n is not container.parent):
+                    content += cleaner.image(node)
+    finally:
+        cleaner.close()
     if len(cleaner.images) < client.config.min_images:
         reason = 'access_restricted' if restricted else 'below_min_images'
         raise InsufficientImages(len(cleaner.images), client.config.min_images, reason)
@@ -924,15 +1123,30 @@ def crawl(config: Config):
     stats = dict(boards=0, pages=0, archived=0, rejected=0, skipped=0, failed=0)
     started = time.monotonic()
     with crawl_lock(config):
-        store = Store(config)
+        progress = Progress(config)
+        progress.update(phase='initializing', stats=stats)
+        LOG.info('crawl_started min_images=%d interval=%.2f timeout=%.2f retries=%d',
+                 config.min_images, config.interval, config.timeout, config.retries)
         try:
+            store = Store(config)
+        except BaseException:
+            progress.update(status='failed', phase='initializing_failed')
+            raise
+        try:
+            LOG.info('recovery_started')
+            progress.update(phase='recovery')
             store.recover()
             client = Client(config)
+            client.progress = progress
+            client.request_kind = 'home'
+            progress.update(phase='home')
+            LOG.info('home_started')
             root, base = client.page(config.url)
             style = forum_style(root, base, config.style)
             queue = deque(config.fids or board_ids(root, base))
             if not queue:
                 raise ArchiveError('No boards discovered; check login, template, or configure forum.fids')
+            LOG.info('boards_discovered count=%d style=%s', len(queue), style)
             seen_boards, seen_threads = set(), set()
             while queue:
                 fid = queue.popleft()
@@ -948,6 +1162,9 @@ def crawl(config: Config):
                         if page > config.max_pages:
                             raise ArchiveError('Board page limit reached; this scan is incomplete')
                         listing = board_url(base, style, fid, page)
+                        client.request_kind = 'listing'
+                        progress.update(phase='listing', fid=fid, tid=None, stats=stats)
+                        LOG.info('board_page_started fid=%s page=%d known_last_page=%d', fid, page, maximum)
                         document, actual = client.page(listing, base)
                         stats['pages'] += 1
                         board_summaries = {n.attrs['summary'] for n in document.walk()
@@ -966,6 +1183,8 @@ def crawl(config: Config):
                             verified.update(tid for tid in uncertain if store.terminal(tid))
                             uncertain -= verified
                             if uncertain and sticky_proof is None:
+                                client.request_kind = 'sticky_verification'
+                                progress.update(phase='sticky_verification')
                                 ordinary, ordinary_url = client.page(board_url(base, style, fid, 1, digest=False), actual)
                                 sticky_proof = set(digest_threads(ordinary, ordinary_url))
                             verified.update(uncertain & (sticky_proof or set()))
@@ -976,6 +1195,8 @@ def crawl(config: Config):
                                 LOG.error('unverified_digest_stickies fid=%s count=%d; not archived', fid, len(newly_unresolved))
                                 reported_stickies.update(newly_unresolved)
                         tids = list(digest_threads(document, actual, confirmed, verified))
+                        LOG.info('board_page_parsed fid=%s page=%d candidates=%d last_page=%d',
+                                 fid, page, len(tids), maximum)
                         if not confirmed and not explicit:
                             raise ArchiveError('Server did not confirm digest filtering and no digest markers were found')
                         if not tids and not any(n.attrs.get('id') == 'threadlisttableid' or
@@ -990,14 +1211,21 @@ def crawl(config: Config):
                             known = store.known(tid)
                             if known:
                                 stats['skipped'] += 1
+                                LOG.debug('history_skip tid=%s state=archived', tid)
                                 if not store.path(known['filename']).is_file():
                                     stats['failed'] += 1
                                     LOG.error('local_archive_missing tid=%s; restore backup, no refetch', tid)
                                 continue
                             if store.rejection(tid):
                                 stats['skipped'] += 1
+                                LOG.debug('history_skip tid=%s state=rejected', tid)
                                 continue
                             try:
+                                client.request_kind = 'post'
+                                progress.update(phase='post', tid=tid, image_attempts=0,
+                                                image_available=0, image_failed=0, download_total=0,
+                                                download_completed=0, download_failed=0, stats=stats)
+                                LOG.info('post_started fid=%s tid=%s', fid, tid)
                                 try:
                                     post, post_url = client.page(thread_url(base, style, tid), actual)
                                 except FetchError as error:
@@ -1005,6 +1233,7 @@ def crawl(config: Config):
                                         raise InsufficientImages(0, config.min_images, f'post_http_{error.status}') from None
                                     raise
                                 title, data = extract_post(post, client, post_url)
+                                progress.update(phase='saving')
                                 store.save(tid, title, data)
                                 stats['archived'] += 1
                                 LOG.info('archived tid=%s bytes=%d', tid, len(data))
@@ -1016,6 +1245,7 @@ def crawl(config: Config):
                             except ArchiveError as error:
                                 stats['failed'] += 1
                                 LOG.error('post_failed tid=%s reason=%s', tid, error)
+                            progress.update(stats=stats)
                         page += 1
                 except ArchiveError as error:
                     stats['failed'] += 1
@@ -1024,6 +1254,9 @@ def crawl(config: Config):
             with store.db:
                 store.db.execute("INSERT OR REPLACE INTO meta VALUES('last_run',?)", (json.dumps(stats),))
         finally:
+            failed = sys.exc_info()[0] is not None
+            progress.update(status='failed' if failed else 'finished',
+                            phase='failed' if failed else 'finished', stats=stats)
             store.close()
     LOG.info('crawl_finished %s', json.dumps(stats, sort_keys=True))
     return stats
@@ -1149,7 +1382,7 @@ def make_web_server(config: Config):
                                 rejected=rejected_count(db),
                                 pending=db.execute('SELECT count(*) FROM pending').fetchone()[0],
                                 last_run=json.loads(latest[0]) if latest else None)]
-                    result = json.dumps(cached_state[1]).encode()
+                    result = json.dumps(dict(cached_state[1], current_run=read_progress(config))).encode()
                 return self.send_data(result, 'application/json')
             if path == '/':
                 params = parse_qs(parts.query)
@@ -1372,6 +1605,110 @@ def _service_account() -> str:
     return candidate
 
 
+def service_access_code() -> str:
+    """Read-only probe run as the actual service account; argv keeps n,d,paths."""
+    return r'''
+import json
+import os
+from pathlib import Path
+import sys
+
+n, d = int(sys.argv[1]), int(sys.argv[2])
+paths = sys.argv[3:]
+readable, directories, files = paths[:n], paths[n:n+d], paths[n+d:]
+failures = []
+seen = set()
+
+def issue(operation, path, target):
+    record = (operation, str(path), str(target))
+    if record not in seen:
+        seen.add(record)
+        if len(failures) < 64:
+            failures.append(dict(operation=operation, path=str(path), target=str(target)))
+
+def parents_clear(path):
+    for parent in reversed(path.parents):
+        if not os.path.isdir(parent):
+            issue('missing', parent, path)
+            return False
+        if not os.access(parent, os.X_OK):
+            issue('traverse', parent, path)
+            return False
+    return True
+
+def check(raw, operation, mode, directory=False):
+    path = Path(os.path.abspath(raw))
+    if not parents_clear(path):
+        return
+    if not os.path.exists(path):
+        issue('missing', path, path)
+        return
+    if directory and not os.path.isdir(path):
+        issue('directory', path, path)
+        return
+    if not directory and not os.path.isfile(path):
+        issue('file', path, path)
+        return
+    if not os.access(path, mode):
+        issue(operation, path, path)
+
+for path in readable:
+    check(path, 'read', os.R_OK)
+for path in directories:
+    check(path, 'traverse', os.X_OK, directory=True)
+    check(path, 'write', os.W_OK, directory=True)
+for path in files:
+    check(path, 'write', os.W_OK)
+if len(readable) >= 3:
+    check(readable[2], 'execute', os.X_OK)
+if readable:
+    check(str(Path(os.path.abspath(readable[0])).parent), 'traverse', os.X_OK, directory=True)
+print(json.dumps(dict(uid=os.geteuid(), failures=failures, total_failures=len(seen)), ensure_ascii=True))
+sys.exit(3 if seen else 0)
+'''
+
+
+def format_service_access_error(user: str, stdout, python_path: str) -> str:
+    """Format only trusted schema fields; never echo launcher output or secrets."""
+    def safe(value):
+        return ''.join(character if ord(character) >= 32 and ord(character) != 127 else '?'
+                       for character in str(value))[:4096]
+
+    try:
+        report = json.loads(stdout)
+        failures = report.get('failures') if isinstance(report, dict) else None
+    except (TypeError, ValueError, UnicodeError):
+        failures = None
+    prefix = f"Service account '{safe(user)}' failed access checks."
+    if not isinstance(failures, list) or not failures:
+        return (prefix + f" Python interpreter '{safe(python_path)}' could not start as this account; "
+                'check its execute permission, traversable parent directories and runtime dependencies. '
+                'Use namei -l on the interpreter and installation paths; do not run the service as root.')
+    labels = {'read': 'cannot read file', 'execute': 'cannot execute interpreter',
+              'traverse': 'cannot traverse directory', 'write': 'cannot write',
+              'missing': 'path missing or inaccessible', 'file': 'expected a regular file',
+              'directory': 'expected a directory'}
+    lines = []
+    for entry in failures:
+        if not isinstance(entry, dict) or entry.get('operation') not in labels:
+            continue
+        path, target = entry.get('path'), entry.get('target')
+        if not isinstance(path, str) or not isinstance(target, str):
+            continue
+        line = f"{labels[entry['operation']]}: {safe(path)}"
+        if path != target:
+            line += f" (required for {safe(target)})"
+        if line not in lines:
+            lines.append(line)
+        if len(lines) == 8:
+            break
+    if not lines:
+        return prefix + ' Permission probe returned no usable diagnostics; inspect interpreter execution and parent-directory traversal.'
+    return (prefix + '\n- ' + '\n- '.join(lines) +
+            '\nGrant only the required access to this account or move the installation to an accessible persistent directory. '
+            'Existing data owned by another ordinary user must be explicitly migrated by the administrator.')
+
+
 def _ensure_service_access(config, config_path: Path, script_path: Path,
                            python_path: str, user: str) -> None:
     try:
@@ -1401,6 +1738,7 @@ def _ensure_service_access(config, config_path: Path, script_path: Path,
             os.chown(path, account.pw_uid, account.pw_gid, follow_symlinks=False)
     database = Path(config.db_path).resolve()
     state_files = [Path(str(database) + suffix) for suffix in ('', '-wal', '-shm', '.lock')]
+    state_files.append(database.parent / 'progress.json')
     output_dir = Path(config.output_dir).resolve()
     output_files = [output_dir / '.discuz-archive.json',
                     *output_dir.glob('*.html'), *output_dir.glob('.pending-*.tmp')]
@@ -1425,18 +1763,25 @@ def _ensure_service_access(config, config_path: Path, script_path: Path,
     runuser = shutil.which('runuser')
     if not runuser:
         raise RuntimeError('runuser is required to verify service account permissions')
-    check_code = ('import os,sys; n=int(sys.argv[1]); d=int(sys.argv[2]); '
-                  'ok=all(os.access(p,os.R_OK) for p in sys.argv[3:3+n]) and '
-                  'all(os.access(p,os.W_OK|os.X_OK) for p in sys.argv[3+n:3+n+d]) and '
-                  'all(os.access(p,os.W_OK) for p in sys.argv[3+n+d:]); '
-                  'sys.exit(0 if ok else 3)')
+    check_code = service_access_code()
+    LOG.info('service_access_check user=%s', user)
     result = subprocess.run([runuser, '-u', user, '--', python_path, '-c', check_code,
                              str(len(readable)), str(len(writable)), *(str(p) for p in paths)],
-                            capture_output=True, timeout=30)
+                            capture_output=True, timeout=30, cwd='/')
     if result.returncode:
-        raise RuntimeError('Service user cannot read the interpreter/script/config/Cookie/token/archives or write state; '
-                           'adjust permissions and parent-directory traversal, preferably under /opt. '
-                           'Existing data owned by another ordinary user must be explicitly migrated by the administrator')
+        try:
+            report = json.loads(result.stdout)
+        except (ValueError, TypeError, UnicodeError):
+            report = None
+        output = result.stdout
+        if not isinstance(report, dict) and python_path != '/usr/bin/python3' and Path('/usr/bin/python3').is_file():
+            fallback = subprocess.run([runuser, '-u', user, '--', '/usr/bin/python3', '-c', check_code,
+                                       str(len(readable)), str(len(writable)), *(str(p) for p in paths)],
+                                      capture_output=True, timeout=30, cwd='/')
+            # A successful fallback checks metadata; it cannot prove the configured
+            # interpreter can start, so preserve the original installation failure.
+            output = fallback.stdout
+        raise RuntimeError(format_service_access_error(user, output, python_path))
 
 
 def _write_unit(path: Path, content: str) -> None:
