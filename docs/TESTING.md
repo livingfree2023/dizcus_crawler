@@ -36,4 +36,4 @@ HTTP 测试需要绑定本地回环端口；受限环境需授权。没有 pip �
 
 1.2.2 systemd路径修复：Python3.14完整106项通过（29.956秒）；新增WorkingDirectory单路径编码与校验错误细节回归。真实Ubuntu systemd-analyze verify已对普通路径及空格/百分号路径退出0。安装运行结果见对应特性TASKS，不将临时校验等同于真实启动。
 
-1.3.0子路径反代：Python3.14完整113项通过（33.525秒），Python3.12新增7项专项通过（3.634秒）。真实本地HTTP覆盖重定向、Basic、文章原始字节、分页和PWA前缀/Scope/缓存隔离；目标Caddy候选配置已validate成功，HTTPS部署验证结果见对应特性TASKS。
+1.3.0子路径反代：Python3.14完整113项通过（33.525秒），Python3.12新增7项专项通过（3.634秒）。真实本地HTTP覆盖重定向、Basic、文章原始字节、分页和PWA前缀/Scope/缓存隔离。目标Caddy已validate/reload并部署：公网HTTPS及本机正确SNI/TLS验证均确认入口308、未认证401，认证首页/API/Manifest/脚本/图标200。用户已移走全部本地HTML，故实际文章读取未做，不把中性测试代替真实帖文实测。
