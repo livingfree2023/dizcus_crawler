@@ -61,3 +61,7 @@ Manifest、SVG 图标、注册脚本及 Service Worker 都嵌在 Python 中按�
 官方模板细节：[精华筛选活动标签及图标条件](https://github.com/Discuz-X/DiscuzX/blob/Common/template/default/forum/forumdisplay_list.htm)、[精华等级 SQL](https://github.com/Discuz-X/DiscuzX/blob/Common/source/class/table/table_forum_thread.php#L754)。
 
 参考官方资料：[HTMLParser](https://docs.python.org/3.11/library/html.parser.html)、[SQLite](https://docs.python.org/3.11/library/sqlite3.html)、[systemd service](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html)、[systemd timer](https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.html)。
+
+## 列表日期与选项
+
+新存档从首楼 authorposton 绝对日期文本或 title 属性提取时间，保留论坛原始精度，不推断时区。HTML 元数据与不可变日期侧表支持事务恢复。阅读路径只查询本地 SQLite；旧日期未知，不回源补录。排序采用白名单 SQL，未知时间始终置后；每页允许20/50/100，翻页保留排序和反代前缀，切换选项回到第一页。

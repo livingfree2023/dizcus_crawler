@@ -5,8 +5,10 @@
 - 使用 Python 标准库支持的 SQLite，存放于 `data/archive.sqlite3`，与 `output/` 中的 HTML 分开管理。
 - 归档身份为配置指定的稳定 `forum_key` 加帖子 `tid`，建立联合唯一约束。同一帖跨板块出现或列表参数变化不影响身份；同一论坛更换镜像域名时沿用 forum_key。
 - 成功记录包含 forum_key、tid、首次归档标题、相对文件路径、UTC 归档时间、文件字节数和 SHA-256。正文与图片只存于 HTML，不复制到数据库。
-- schema v2 新增 `rejected`，保存 forum_key、tid、available_images、min_images、reason、rejected_at；不保存被跳过帖子的正文或图片。v1 在下次抓取持锁后事务升级，原成功记录、待完成记录和身份原样保留。
+- schema v2 引入 `rejected`，保存 forum_key、tid、available_images、min_images、reason、rejected_at；不保存被跳过帖子的正文或图片。旧库在下次抓取持锁后事务升级，原成功记录、待完成记录和身份原样保留。
 - 标题不能充当唯一键；同名帖子可能不同，已归档帖标题也可能在源站变更。
+
+当前 schema v3 新增 `archive_dates` 侧表，以 forum_key+tid 关联成功记录，保存规范化的原始发帖时间。日期与成功记录同事务提交且禁止更新/删除；已准备的 HTML 元数据可用于崩溃恢复。旧记录不回填，不改写原 HTML。只读服务兼容 v1/v2。
 
 ## 不可更新规则
 

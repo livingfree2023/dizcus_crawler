@@ -38,7 +38,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlsplit, urlunsplit, quo
 from urllib.request import Request, build_opener, HTTPCookieProcessor, HTTPRedirectHandler
 from urllib.robotparser import RobotFileParser
 
-VERSION = '1.3.0'
+VERSION = '1.4.0'
 LOG = logging.getLogger('discuz-archive')
 TRACE = secrets.token_hex(6)
 VOID = {'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr'}
@@ -826,6 +826,11 @@ nav{display:flex;gap:24px;margin-top:24px;font-size:14px}footer{margin-top:36px;
 @media print{html{background:#fff}main{border:0;margin:0;padding:0;max-width:none}footer{display:none}}
 '''
 CSP = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"
+STYLE += '''
+.toolbar{display:flex;gap:14px;align-items:end;flex-wrap:wrap;margin:26px 0 22px}.toolbar label{display:flex;flex-direction:column;gap:4px;color:#657469;font-size:12px}.toolbar select,.toolbar button{font:inherit;font-size:14px;padding:8px 12px;border:1px solid #dbe2da;border-radius:4px;background:#fff;color:#29342e}.toolbar button{background:#39634d;color:#fff;border-color:#39634d;cursor:pointer}
+.archive-list{display:table;width:100%;font-size:14px}.archive-list th,.archive-list td{border:0;border-bottom:1px solid #e6e9e5;text-align:left;padding:17px 8px 17px 0;vertical-align:top}.archive-list th{font-size:12px;color:#7c857f;font-weight:500}.archive-list th:nth-child(2){width:162px}.archive-list th:nth-child(3){width:100px}.archive-list td time{font-size:12px;color:#7c857f;white-space:nowrap}.archive-list td a{text-decoration:none}.archive-list td:first-child{overflow-wrap:anywhere}
+@media(max-width:650px){.archive-list,.archive-list tbody{display:block}.archive-list thead{display:none}.archive-list tr{display:grid;grid-template-columns:1fr 1fr;border-bottom:1px solid #e6e9e5;padding:14px 0;gap:6px}.archive-list td{border:0;padding:0}.archive-list td:first-child{grid-column:1/-1}.archive-list td[data-label]::before{content:attr(data-label) ' ';font-size:11px;color:#7c857f}.toolbar{gap:10px}}
+'''
 
 
 def normalize_base_path(value):
@@ -838,10 +843,40 @@ def normalize_base_path(value):
     return value.rstrip('/')
 
 
-def shell(title: str, content: str, *, web=False, base_path=''):
+def normalize_publication(value):
+    if not isinstance(value, str):
+        return None
+    match = re.search(r'(?<!\d)(\d{4})\s*[-/.年]\s*(\d{1,2})\s*[-/.月]\s*(\d{1,2})日?(?:[\sT]+(\d{1,2}):(\d{2})(?::(\d{2}))?)?(?!\d)', value)
+    if not match:
+        return None
+    year, month, day, hour, minute, second = match.groups()
+    try:
+        date = datetime(int(year), int(month), int(day), int(hour or 0), int(minute or 0), int(second or 0))
+    except ValueError:
+        return None
+    return date.date().isoformat() if hour is None else date.isoformat(sep=' ', timespec='minutes' if second is None else 'seconds')
+
+
+def publication_from_html(data):
+    class Parser(HTMLParser):
+        value = None
+
+        def handle_starttag(self, tag, attrs):
+            attrs = dict(attrs)
+            if tag == 'meta' and attrs.get('name') == 'discuz-published-at':
+                self.value = normalize_publication(attrs.get('content'))
+
+    parser = Parser()
+    parser.feed(data[:65536].decode('utf-8', errors='ignore'))
+    return parser.value
+
+
+def shell(title: str, content: str, *, web=False, base_path='', published_at=None):
     extras = (f'<link rel="manifest" href="{base_path}/manifest.webmanifest"><link rel="icon" href="{base_path}/icon.svg">'
               f'<meta name="theme-color" content="#39634d"><script src="{base_path}/app.js" defer></script>') if web else ''
-    policy = CSP + ("; script-src 'self'; worker-src 'self'; manifest-src 'self'; connect-src 'self'; img-src-elem 'self' data:" if web else '')
+    if published_at:
+        extras += '<meta name="discuz-published-at" content="' + html.escape(published_at, quote=True) + '">'
+    policy = (CSP.replace("form-action 'none'", "form-action 'self'") if web else CSP) + ("; script-src 'self'; worker-src 'self'; manifest-src 'self'; connect-src 'self'; img-src-elem 'self' data:" if web else '')
     return ('<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width,initial-scale=1">'
             '<meta http-equiv="Content-Security-Policy" content="' + html.escape(policy, quote=True) + '">'
@@ -889,8 +924,13 @@ def extract_post(root: Node, client: Client, page: str):
     author_node = next((n for n in container.walk() if n.tag == 'a' and
                         ('uid=' in n.attrs.get('href', '') or 'xw1' in n.classes())), None)
     author = author_node.text().strip() if author_node else ''
-    published = next((n.text().strip() for n in container.walk()
-                      if n.attrs.get('id', '').startswith('authorposton')), '')
+    publication_node = next((n for n in container.walk() if n.attrs.get('id', '').startswith('authorposton')), None)
+    published = publication_node.text().strip() if publication_node else ''
+    absolute = None
+    if publication_node:
+        absolute = next((date for n in publication_node.walk()
+                         if (date := normalize_publication(n.attrs.get('title')))), None)
+    absolute = absolute or normalize_publication(published)
     cleaner = Cleaner(client, page)
     body_scope = [body]
     if container is not body:
@@ -921,7 +961,7 @@ def extract_post(root: Node, client: Client, page: str):
              html.escape(page, quote=True) + '">原帖</a> · 内容版权归原作者所有。'
              '此文件保存首次接受归档时可获取的内容。作者：***。</p></details></footer>')
     result = shell(title, '<article><h1>' + html.escape(title) + '</h1><div class="meta">' +
-                   metadata + '</div>' + content + '</article>' + about)
+                   metadata + '</div>' + content + '</article>' + about, published_at=absolute)
     if len(result) > client.config.max_post_bytes:
         raise ArchiveError('Final HTML exceeds configured size limit')
     return title, result
@@ -965,6 +1005,17 @@ CREATE TABLE IF NOT EXISTS archives(
  size INTEGER NOT NULL, archived_at TEXT NOT NULL,
  UNIQUE(forum_key,tid));
 CREATE INDEX IF NOT EXISTS archive_date ON archives(archived_at DESC,id DESC);
+CREATE TABLE IF NOT EXISTS archive_dates(
+ forum_key TEXT NOT NULL, tid TEXT NOT NULL, published_at TEXT NOT NULL,
+ PRIMARY KEY(forum_key,tid), FOREIGN KEY(forum_key,tid) REFERENCES archives(forum_key,tid));
+CREATE INDEX IF NOT EXISTS publication_date ON archive_dates(published_at);
+CREATE TRIGGER IF NOT EXISTS publication_immutable_update BEFORE UPDATE ON archive_dates
+ BEGIN SELECT RAISE(ABORT,'first publication metadata is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS publication_immutable_delete BEFORE DELETE ON archive_dates
+ BEGIN SELECT RAISE(ABORT,'first publication metadata is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS publication_requires_archive BEFORE INSERT ON archive_dates
+ WHEN NOT EXISTS(SELECT 1 FROM archives WHERE forum_key=NEW.forum_key AND tid=NEW.tid)
+ BEGIN SELECT RAISE(ABORT,'publication metadata requires a successful archive'); END;
 CREATE TABLE IF NOT EXISTS pending(
  forum_key TEXT NOT NULL, tid TEXT NOT NULL, title TEXT NOT NULL,
  filename TEXT NOT NULL UNIQUE, tmp_name TEXT NOT NULL, sha256 TEXT NOT NULL,
@@ -992,7 +1043,7 @@ CREATE TRIGGER IF NOT EXISTS pending_excludes_terminal BEFORE INSERT ON pending
  WHEN EXISTS(SELECT 1 FROM archives WHERE forum_key=NEW.forum_key AND tid=NEW.tid)
  OR EXISTS(SELECT 1 FROM rejected WHERE forum_key=NEW.forum_key AND tid=NEW.tid)
  BEGIN SELECT RAISE(ABORT,'post has terminal history'); END;
-PRAGMA user_version=2;
+PRAGMA user_version=3;
 '''
 
 
@@ -1020,8 +1071,8 @@ class Store:
         if existed:
             tables = {x[0] for x in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             version = self.db.execute('PRAGMA user_version').fetchone()[0]
-            required = {'archives', 'pending', 'meta'} | ({'rejected'} if version == 2 else set())
-            if not required <= tables or version not in {1, 2}:
+            required = {'archives', 'pending', 'meta'} | ({'rejected'} if version >= 2 else set()) | ({'archive_dates'} if version >= 3 else set())
+            if not required <= tables or version not in {1, 2, 3}:
                 raise ArchiveError('Unknown or incomplete history schema; do not initialize over existing archives')
         self.db.execute('PRAGMA journal_mode=WAL')
         self.db.execute('PRAGMA synchronous=FULL')
@@ -1084,6 +1135,8 @@ class Store:
             raise ArchiveError('Prepared archive file is missing; restore local state before retrying')
         with source.open('rb') as file:
             digest = hashlib.file_digest(file, 'sha256').hexdigest()
+            file.seek(0)
+            publication = publication_from_html(file.read(65536))
         if digest != row['sha256'] or source.stat().st_size != row['size']:
             raise ArchiveError('Prepared archive checksum mismatch; refusing to overwrite or refetch')
         if not target.exists():
@@ -1093,6 +1146,9 @@ class Store:
             self.db.execute('INSERT INTO archives(forum_key,tid,title,filename,sha256,size,archived_at) '
                             'VALUES(?,?,?,?,?,?,?)', tuple(row[k] for k in
                              ('forum_key','tid','title','filename','sha256','size','archived_at')))
+            if publication:
+                self.db.execute('INSERT INTO archive_dates VALUES(?,?,?)',
+                                (row['forum_key'], row['tid'], publication))
             self.db.execute('DELETE FROM pending WHERE forum_key=? AND tid=?', (row['forum_key'], row['tid']))
         temporary.unlink(missing_ok=True)
         fsync_dir(self.config.output_dir)
@@ -1331,6 +1387,68 @@ ICON = b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width
 SW = b'''const NAME='discuz-shell-v1';self.addEventListener('install',e=>e.waitUntil(caches.open(NAME).then(c=>c.addAll(['/offline','/icon.svg']))));self.addEventListener('activate',e=>e.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(k=>k.startsWith('discuz-shell-')&&k!==NAME).map(k=>caches.delete(k))))));self.addEventListener('fetch',e=>{if(e.request.mode==='navigate'&&new URL(e.request.url).origin===self.location.origin)e.respondWith(fetch(e.request).catch(()=>caches.match('/offline')))});'''
 
 
+def listing_options(query):
+    params = parse_qs(query, keep_blank_values=True)
+
+    def option(key, default):
+        values = params.get(key, [default])
+        if len(values) != 1:
+            raise ValueError('Duplicate listing option')
+        return values[0]
+
+    page, size, sort = option('page', '1'), option('per_page', '50'), option('sort', 'archived_desc')
+    if not page.isascii() or not page.isdecimal() or not 1 <= int(page) <= 1000000:
+        raise ValueError('Invalid page')
+    if size not in {'20', '50', '100'} or sort not in {'archived_desc', 'published_desc', 'published_asc'}:
+        raise ValueError('Invalid listing option')
+    return int(page), int(size), sort
+
+
+def listing_url(prefix, page, size, sort):
+    params = {'page': str(page)}
+    if size != 50 or sort != 'archived_desc':
+        params.update(per_page=str(size), sort=sort)
+    return prefix + '/?' + urlencode(params)
+
+
+def listing_rows(db, page, size, sort):
+    modern = db.execute('PRAGMA user_version').fetchone()[0] >= 3
+    date = 'd.published_at' if modern else 'NULL'
+    join = ' LEFT JOIN archive_dates d ON a.forum_key=d.forum_key AND a.tid=d.tid' if modern else ''
+    ordering = {'archived_desc': 'a.archived_at DESC,a.id DESC',
+                'published_desc': f'({date} IS NULL) ASC,{date} DESC,a.id DESC',
+                'published_asc': f'({date} IS NULL) ASC,{date} ASC,a.id DESC'}[sort]
+    count = db.execute('SELECT count(*) FROM archives').fetchone()[0]
+    rows = db.execute(f'SELECT a.id,a.title,a.archived_at,{date} AS published_at FROM archives a{join} '
+                      f'ORDER BY {ordering} LIMIT ? OFFSET ?', (size, (page-1)*size)).fetchall()
+    return count, rows
+
+
+def render_listing(prefix, count, rows, page, size, sort):
+    content = '<p class="label">离线阅读</p><h1>帖子存档</h1><p class="muted">共 ' + str(count) + ' 篇</p>'
+    content += '<form class="toolbar" method="get" action="' + prefix + '/"><label for="sort">排序<select id="sort" name="sort">'
+    for value, label in (('archived_desc', '归档时间：新到旧'), ('published_desc', '发帖时间：新到旧'), ('published_asc', '发帖时间：旧到新')):
+        content += '<option value="'+value+'"'+(' selected' if value == sort else '')+'>'+label+'</option>'
+    content += '</select></label><label for="per_page">每页<select id="per_page" name="per_page">'
+    for value in (20, 50, 100):
+        content += '<option value="'+str(value)+'"'+(' selected' if value == size else '')+'>'+str(value)+' 篇</option>'
+    content += '</select></label><button type="submit">应用</button></form>'
+    toggle = 'published_asc' if sort == 'published_desc' else 'published_desc'
+    arrow = ' ↓' if sort == 'published_desc' else (' ↑' if sort == 'published_asc' else '')
+    aria = 'descending' if sort == 'published_desc' else ('ascending' if sort == 'published_asc' else 'none')
+    content += '<table class="archive-list"><thead><tr><th>标题</th><th aria-sort="'+aria+'"><a href="'+html.escape(listing_url(prefix, 1, size, toggle), quote=True)+'">原始发帖时间'+arrow+'</a></th><th>归档时间</th></tr></thead><tbody>'
+    for row in rows:
+        publication = row['published_at']
+        stamp = ('<time datetime="'+html.escape(publication.replace(' ', 'T'), quote=True)+'">'+html.escape(publication)+'</time>') if publication else '<span class="muted">未知</span>'
+        content += '<tr><td><a href="'+prefix+'/post/'+str(row['id'])+'">'+html.escape(row['title'])+'</a></td><td data-label="发帖">'+stamp+'</td><td data-label="归档"><time>'+html.escape(row['archived_at'][:10])+'</time></td></tr>'
+    content += '</tbody></table>' + ('<p class="muted">还没有存档。</p>' if not count else '') + '<nav>'
+    if page > 1:
+        content += '<a href="'+html.escape(listing_url(prefix,page-1,size,sort),quote=True)+'">上一页</a>'
+    if page*size < count:
+        content += '<a href="'+html.escape(listing_url(prefix,page+1,size,sort),quote=True)+'">下一页</a>'
+    return content+'</nav><footer><details><summary>关于</summary><p>本地首次存档，只读浏览。内容版权归原作者所有。作者：***。</p></details></footer>'
+
+
 def make_web_server(config: Config):
     prefix = normalize_base_path(config.web_base_path)
     token = ''
@@ -1357,7 +1475,7 @@ def make_web_server(config: Config):
             self.send_header('X-Content-Type-Options', 'nosniff')
             self.send_header('Referrer-Policy', 'no-referrer')
             self.send_header('X-Frame-Options', 'DENY')
-            self.send_header('Content-Security-Policy', CSP + "; script-src 'self'; worker-src 'self'; manifest-src 'self'; connect-src 'self'; img-src-elem 'self' data:")
+            self.send_header('Content-Security-Policy', CSP.replace("form-action 'none'", "form-action 'self'") + "; script-src 'self'; worker-src 'self'; manifest-src 'self'; connect-src 'self'; img-src-elem 'self' data:")
             for key, value in (extra or {}).items():
                 self.send_header(key, value)
             self.end_headers()
@@ -1423,29 +1541,19 @@ def make_web_server(config: Config):
                     result = json.dumps(dict(cached_state[1], current_run=read_progress(config))).encode()
                 return self.send_data(result, 'application/json')
             if path == '/':
-                params = parse_qs(parts.query)
-                value = params.get('page', ['1'])[0]
-                if not value.isdecimal() or not 1 <= int(value) <= 1000000:
-                    return self.send_data(b'Invalid page', 'text/plain', 400)
-                page = int(value)
+                try:
+                    page, size, sort = listing_options(parts.query)
+                except ValueError:
+                    return self.send_data(b'Invalid listing options', 'text/plain', 400)
                 try:
                     with readonly_db(config) as db:
-                        count = db.execute('SELECT count(*) FROM archives').fetchone()[0]
-                        rows = db.execute('SELECT id,title,archived_at FROM archives ORDER BY archived_at DESC,id DESC LIMIT 50 OFFSET ?', ((page-1)*50,)).fetchall()
+                        count, rows = listing_rows(db, page, size, sort)
                 except ArchiveError:
                     if (config.db_path.exists() or (config.output_dir / '.discuz-archive.json').exists()
                             or any(config.output_dir.glob('*.html'))):
                         raise
                     count, rows = 0, []
-                content = '<p class="label">离线阅读</p><h1>帖子存档</h1><p class="muted">共 ' + str(count) + ' 篇</p><ul class="posts">'
-                content += ''.join('<li><a href="' + prefix + '/post/' + str(r['id']) + '"><span>' + html.escape(r['title']) +
-                                   '</span><time>' + html.escape(r['archived_at'][:10]) + '</time></a></li>' for r in rows)
-                content += '</ul>' + ('<p class="muted">还没有存档。</p>' if not count else '') + '<nav>'
-                if page > 1:
-                    content += f'<a href="{prefix}/?page={page-1}">上一页</a>'
-                if page*50 < count:
-                    content += f'<a href="{prefix}/?page={page+1}">下一页</a>'
-                content += '</nav><footer><details><summary>关于</summary><p>本地首次存档，只读浏览。内容版权归原作者所有。作者：***。</p></details></footer>'
+                content = render_listing(prefix, count, rows, page, size, sort)
                 return self.send_data(shell('帖子存档', content, web=True, base_path=prefix))
             match = re.fullmatch(r'/post/(\d+)', path)
             if match:

@@ -478,7 +478,7 @@ class ThresholdHistoryTests(unittest.TestCase):
         with patch.object(archive.Client, '__init__', side_effect=AssertionError('Migration must not access network')):
             store = archive.Store(config)
             self.addCleanup(store.close)
-            self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 2)
+            self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 3)
             self.assertEqual(store.db.execute("SELECT value FROM meta WHERE key='identity'").fetchone()[0], identity)
             self.assertEqual(store.known('101')['filename'], 'First.html')
             self.assertEqual(store.db.execute('SELECT count(*) FROM pending').fetchone()[0], 1)
